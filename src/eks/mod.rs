@@ -62,6 +62,9 @@ pub mod scalar;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 
+#[cfg(target_arch = "x86_64")]
+pub mod avx2;
+
 // SIMD backend modules land one per later phase. Each adds its
 // `#[cfg(...)] pub mod <isa>;` here AND flips its arm in `bcrypt_lanes_fn`
 // from `scalar::bcrypt_lanes` to the real kernel in the same commit, so the
@@ -359,18 +362,20 @@ pub fn backend() -> Backend {
 /// Use [`Backend::is_available`] first, or take the value from [`backend`].
 #[must_use]
 pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
-    // On-arch Neon runs its real kernel. The remaining SIMD arms still
-    // resolve to scalar; each backend flips its own arm (plus its `pub mod`
-    // above) when it lands.
+    // On-arch Neon and Avx2 run their real kernels. The remaining SIMD
+    // arms still resolve to scalar; each backend flips its own arm (plus
+    // its `pub mod` above) when it lands.
     match backend {
         Backend::Scalar => scalar::bcrypt_lanes,
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => neon::bcrypt_lanes,
         #[cfg(not(target_arch = "aarch64"))]
         Backend::Neon => scalar::bcrypt_lanes,
-        Backend::Sse41 | Backend::Avx2 | Backend::Avx512 | Backend::Wasm128 => {
-            scalar::bcrypt_lanes
-        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2 => avx2::bcrypt_lanes,
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Avx2 => scalar::bcrypt_lanes,
+        Backend::Sse41 | Backend::Avx512 | Backend::Wasm128 => scalar::bcrypt_lanes,
     }
 }
 

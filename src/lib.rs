@@ -298,5 +298,7 @@ pub mod __internal {
         pub use crate::eks::scalar;
         #[cfg(target_arch = "aarch64")]
         pub use crate::eks::neon;
+        #[cfg(target_arch = "x86_64")]
+        pub use crate::eks::avx2;
     }
 }
