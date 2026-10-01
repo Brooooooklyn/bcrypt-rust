@@ -1,0 +1,230 @@
+//! bcrypt's base64 dialect, stack-only.
+//!
+//! Bit packing is MSB-first exactly like RFC 4648; only the alphabet
+//! (`./A-Za-z0-9`, in that order) and the absence of padding differ. bcrypt
+//! uses exactly two payload sizes — 16 salt bytes in 22 chars, 23 hash bytes
+//! in 31 — so the API is fixed-size arrays and never allocates.
+//!
+//! Neither 16 nor 23 bytes is a multiple of 3, so the final char of each
+//! encoding carries spare low bits. The encoder zeroes them (canonical
+//! form); the decoder ignores them, which is why decoding is only defined on
+//! the exact lengths below.
+
+/// The bcrypt alphabet: index 0 is `'.'`, 1 is `'/'`, then `A`–`Z`, `a`–`z`,
+/// `0`–`9` — *not* the RFC 4648 order.
+const ALPHABET: &[u8; 64] =
+    b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Encoded length of a 16-byte salt.
+pub(crate) const SALT_B64_LEN: usize = 22;
+/// Encoded length of a 23-byte hash payload (the 24-byte bcrypt ciphertext
+/// with its last byte dropped).
+pub(crate) const HASH_B64_LEN: usize = 31;
+
+/// Marker in [`DECODE`] for bytes outside the alphabet.
+const INVALID: u8 = 0xFF;
+
+/// Byte → 6-bit value, built at compile time.
+const DECODE: [u8; 256] = {
+    let mut table = [INVALID; 256];
+    let mut i = 0;
+    while i < 64 {
+        table[ALPHABET[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
+
+/// MSB-first packing of `bytes` into alphabet chars; `out` is filled exactly.
+fn encode_into(bytes: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), (bytes.len() * 8).div_ceil(6));
+    let mut o = 0;
+    let mut groups = bytes.chunks_exact(3);
+    for g in &mut groups {
+        let (b0, b1, b2) = (g[0], g[1], g[2]);
+        out[o] = ALPHABET[(b0 >> 2) as usize];
+        out[o + 1] = ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        out[o + 2] = ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize];
+        out[o + 3] = ALPHABET[(b2 & 0x3f) as usize];
+        o += 4;
+    }
+    // Partial final group: one leftover byte contributes its 8 bits to two
+    // chars, two leftover bytes to three; the spare low bits stay zero.
+    match groups.remainder() {
+        [b0] => {
+            let b0 = *b0;
+            out[o] = ALPHABET[(b0 >> 2) as usize];
+            out[o + 1] = ALPHABET[((b0 & 0x03) << 4) as usize];
+        }
+        [b0, b1] => {
+            let (b0, b1) = (*b0, *b1);
+            out[o] = ALPHABET[(b0 >> 2) as usize];
+            out[o + 1] = ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+            out[o + 2] = ALPHABET[((b1 & 0x0f) << 2) as usize];
+        }
+        _ => {}
+    }
+}
+
+/// The 6-bit value of one char, or `Err` for a byte outside the alphabet.
+fn decode_char(c: u8) -> Result<u8, ()> {
+    match DECODE[c as usize] {
+        INVALID => Err(()),
+        v => Ok(v),
+    }
+}
+
+/// Inverse of [`encode_into`]; `out` is filled exactly. The spare low bits of
+/// a final partial group are discarded, matching every other bcrypt codec.
+fn decode_into(s: &[u8], out: &mut [u8]) -> Result<(), ()> {
+    debug_assert_eq!(out.len(), s.len() * 6 / 8);
+    let mut o = 0;
+    let mut groups = s.chunks_exact(4);
+    for g in &mut groups {
+        let v0 = decode_char(g[0])?;
+        let v1 = decode_char(g[1])?;
+        let v2 = decode_char(g[2])?;
+        let v3 = decode_char(g[3])?;
+        out[o] = (v0 << 2) | (v1 >> 4);
+        out[o + 1] = ((v1 & 0x0f) << 4) | (v2 >> 2);
+        out[o + 2] = ((v2 & 0x03) << 6) | v3;
+        o += 3;
+    }
+    match groups.remainder() {
+        [] => Ok(()),
+        [c0, c1] => {
+            let v0 = decode_char(*c0)?;
+            let v1 = decode_char(*c1)?;
+            out[o] = (v0 << 2) | (v1 >> 4);
+            Ok(())
+        }
+        [c0, c1, c2] => {
+            let v0 = decode_char(*c0)?;
+            let v1 = decode_char(*c1)?;
+            let v2 = decode_char(*c2)?;
+            out[o] = (v0 << 2) | (v1 >> 4);
+            out[o + 1] = ((v1 & 0x0f) << 4) | (v2 >> 2);
+            Ok(())
+        }
+        // A lone leftover char carries only 6 bits — never a whole byte.
+        _ => Err(()),
+    }
+}
+
+/// Encode a 16-byte salt to its 22-char bcrypt base64 form.
+pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
+    let mut out = [0u8; SALT_B64_LEN];
+    encode_into(bytes, &mut out);
+    out
+}
+
+/// Encode the 23 hash bytes to their 31-char bcrypt base64 form.
+pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
+    let mut out = [0u8; HASH_B64_LEN];
+    encode_into(bytes, &mut out);
+    out
+}
+
+/// Decode exactly [`SALT_B64_LEN`] chars back to the 16-byte salt.
+pub(crate) fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
+    if s.len() != SALT_B64_LEN {
+        return Err(());
+    }
+    let mut out = [0u8; 16];
+    decode_into(s, &mut out)?;
+    Ok(out)
+}
+
+/// Decode exactly [`HASH_B64_LEN`] chars back to the 23 hash bytes.
+pub(crate) fn decode_23(s: &[u8]) -> Result<[u8; 23], ()> {
+    if s.len() != HASH_B64_LEN {
+        return Err(());
+    }
+    let mut out = [0u8; 23];
+    decode_into(s, &mut out)?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// xorshift64* — a deterministic byte source for round-trips, so the
+    /// tests need no rand crate and no alloc.
+    struct Rng(u64);
+
+    impl Rng {
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                *b = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn salt_cross_check() {
+        // The salt half of a well-known John the Ripper test vector.
+        let bytes: [u8; 16] = [
+            38, 113, 212, 141, 108, 213, 195, 166, 201, 38, 20, 13, 47, 40, 104, 18,
+        ];
+        assert_eq!(&encode_16(&bytes), b"HlFShUxTu4ZHHfOLJwfmCe");
+        assert_eq!(decode_16(b"HlFShUxTu4ZHHfOLJwfmCe"), Ok(bytes));
+    }
+
+    #[test]
+    fn round_trip_16_and_23() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut b16 = [0u8; 16];
+        let mut b23 = [0u8; 23];
+        for _ in 0..256 {
+            rng.fill(&mut b16);
+            rng.fill(&mut b23);
+            assert_eq!(decode_16(&encode_16(&b16)), Ok(b16));
+            assert_eq!(decode_23(&encode_23(&b23)), Ok(b23));
+        }
+    }
+
+    #[test]
+    fn encode_16_last_char_is_structurally_constrained() {
+        // 16 bytes = 128 bits; the 22nd char carries only the top 2 of its
+        // 6 bits, so its alphabet index is one of 0, 16, 32, 48.
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        let mut bytes = [0u8; 16];
+        for _ in 0..64 {
+            rng.fill(&mut bytes);
+            let last = encode_16(&bytes)[SALT_B64_LEN - 1];
+            assert!(matches!(last, b'.' | b'O' | b'e' | b'u'));
+        }
+    }
+
+    #[test]
+    fn encode_23_last_char_index_is_multiple_of_4() {
+        // 23 bytes = 184 bits; the 31st char carries only the top 4 of its
+        // 6 bits, so its alphabet index is 0 mod 4.
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        let mut bytes = [0u8; 23];
+        for _ in 0..64 {
+            rng.fill(&mut bytes);
+            let last = encode_23(&bytes)[HASH_B64_LEN - 1];
+            assert_eq!(DECODE[last as usize] % 4, 0);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_chars_and_wrong_lengths() {
+        // '!' and '*' are outside the bcrypt alphabet.
+        assert!(decode_16(b"CCCCCCCCCCCCCCCCCCCCC!").is_err());
+        assert!(decode_23(b"7uG0VCzI2bS7j6ymqJi9CdcdxiRTWN*").is_err());
+        // One char short, one char long, and a wildly wrong length.
+        assert!(decode_16(b"CCCCCCCCCCCCCCCCCCCCC").is_err());
+        assert!(decode_16(b"CCCCCCCCCCCCCCCCCCCCC..").is_err());
+        assert!(decode_23(b"7uG0VCzI2bS7j6ymqJi9CdcdxiRTWN").is_err());
+        assert!(decode_23(&[b'C'; 32]).is_err());
+        assert!(decode_16(&[]).is_err());
+    }
+}

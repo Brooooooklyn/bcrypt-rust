@@ -1,0 +1,78 @@
+[package]
+name = "bcrypt-rust"
+version = "0.1.0"
+edition = "2024"
+# Pinned by ONE thing: `stdarch_x86_avx512` (AVX-512 intrinsics + the `avx512f`
+# target feature) stabilized in Rust 1.89. Nothing else here needs newer.
+# Raise it only with a reason, and update the CI `msrv` job in the same commit.
+rust-version = "1.89"
+description = "Pure-Rust bcrypt with runtime-dispatched SIMD backends for batch hashing"
+license = "MIT"
+repository = "https://github.com/Brooooooklyn/bcrypt-rust"
+homepage = "https://github.com/Brooooooklyn/bcrypt-rust"
+documentation = "https://docs.rs/bcrypt-rust"
+readme = "README.md"
+exclude = ["/.github", "/benches", "/tests", "/fuzz", "/crypt_blowfish", "/docs"]
+keywords = ["bcrypt", "password-hash", "simd", "crypto", "blowfish"]
+categories = ["cryptography", "no-std"]
+# Bench targets are declared explicitly as they land; `benches/support/` is a
+# module they `#[path]`-include, not a bench of its own.
+autobenches = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The library target is `bcrypt_rust` (dashes become underscores).
+# Tests and benches use `use bcrypt_rust::...`.
+
+[features]
+default = ["std", "zeroize"]
+
+# Enables runtime CPU feature detection (needs `std::arch::is_*_feature_detected!`).
+# Without it, backend selection falls back to compile-time `target_feature` cfgs.
+# Also enables OS-entropy salt generation (`hash`, `hash_many`, …).
+std = ["alloc"]
+
+# String-returning APIs (`hash`, `verify`, PHC-style formatting). Without it,
+# only the raw byte-oriented API is available.
+alloc = []
+
+# Securely wipe internal buffers that hold key material (lane states, padded
+# password buffers) with a compiler fence that survives `-O3`.
+zeroize = []
+
+# Split large batches across `std::thread::scope` workers. Off by default:
+# worth it only above a measurable batch-size threshold (documented with
+# numbers once the bench suite lands).
+parallel = ["std"]
+
+# Exposes `bcrypt_rust::__internal` so tests/benches can drive individual
+# backends. Not part of the stable API; enabled for dev builds via the
+# self-dev-dependency below.
+internal-api = []
+
+[dependencies]
+# None. OS entropy is hand-declared per platform (`src/random.rs`), the
+# constant-time compare and secure wipe are hand-rolled, and the bcrypt base64
+# codec is 60 lines of scalar code — a 23-byte payload could never repay a SIMD
+# or external-codec dependency.
+
+[dev-dependencies]
+# Self-dev-dependency: makes `cargo test` / `cargo bench` build the lib with
+# `internal-api` on, without leaking it into a plain `cargo build`.
+# `default-features = false` keeps `cargo test --no-default-features` honest.
+bcrypt-rust = { path = ".", default-features = false, features = ["internal-api"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# `panic` deliberately left at the default: the library must not panic on any
+# input reachable through the public API, so `abort` would buy nothing and it
+# would break `cargo test`.
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,15 @@
+bcrypt-rust
+Copyright (c) 2026 LongYinan
+
+This crate is a clean Rust implementation of bcrypt (Provos & Mazières,
+USENIX 1999) following the OpenBSD semantics that are the de-facto standard.
+
+The vendored C reference implementation under `crypt_blowfish/` is Openwall
+crypt_blowfish 1.3 by Solar Designer, which is placed in the public domain
+("No copyright is claimed, and the software is hereby placed in the public
+domain"). It is used only by this crate's tests and benchmarks as a
+differential reference; it is not linked into the library.
+
+The Blowfish P-array and S-box initial values in `src/consts.rs` are the
+hexadecimal digits of the fractional part of pi, transcribed from that
+public-domain source and cross-checked against OpenBSD `blowfish.c`.
