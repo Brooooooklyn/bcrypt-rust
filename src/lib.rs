@@ -17,9 +17,8 @@
 //! Single-hash latency is unchanged, and [`hash`] / [`verify`] always run
 //! the scalar kernel — they never see a [`Backend`] value at all.
 //!
-//! Measured batch gains (Apple M5 Max, rustc 1.98, cost 5,
-//! `benches/micro.rs` — every timed iteration asserted byte-identical to
-//! scalar):
+//! Measured batch gains (`benches/micro.rs` — every timed iteration
+//! asserted byte-identical to scalar). Apple M5 Max (aarch64), cost 5:
 //!
 //! | backend | lanes | batch | hashes/s | vs scalar |
 //! |---|---|---|---|---|
@@ -28,11 +27,11 @@
 //! | NEON | 4 | 4 | 2248.3 | 2.82× |
 //! | wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
 //!
-//! x86 backends are correctness-verified (SSE4.1/AVX2 executed under Rosetta
-//! 2 and QEMU TCG; AVX-512 compile- and review-verified, runs on hardware)
-//! but this machine has no hardware-representative x86 throughput path —
-//! Rosetta translation dominates any number it produces. See the README for
-//! the full verification matrix.
+//! AMD EPYC Zen 4 (x86_64, 4 vCPU), cost 5, batch 16: scalar 564.2 h/s,
+//! SSE4.1 1.12×, AVX2 1.54×, AVX-512 1.42× (Zen 4's 64 KiB SoA working set
+//! and double-pumped 512-bit ops favor AVX2; see the README). Batch-16
+//! speedup vs the `bcrypt` crate: 3.01× (M5 Max) / 1.68× (Zen 4); full
+//! tables and the `parallel` numbers are in the README.
 //!
 //! The batch entry points are [`bcrypt_many`], [`hash_many`],
 //! [`hash_many_with_salts`] and [`verify_many`].

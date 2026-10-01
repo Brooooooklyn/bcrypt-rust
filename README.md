@@ -26,10 +26,11 @@ scalar kernel.
 
 ## Performance
 
-Measured on an **Apple M5 Max** (aarch64), rustc 1.98.0, cost 5, via
-`benches/micro.rs`. The harness is correctness-gated: every timed iteration's
+Measured via `benches/micro.rs` (correctness-gated: every timed iteration's
 output is asserted byte-identical to the scalar batch, so a divergent kernel
-aborts instead of posting a fast-but-wrong number.
+aborts instead of posting a fast-but-wrong number).
+
+**Apple M5 Max** (aarch64), rustc 1.98.0, cost 5:
 
 | backend | lanes | batch | hashes/s | vs scalar |
 |---|---|---|---|---|
@@ -38,14 +39,63 @@ aborts instead of posting a fast-but-wrong number.
 | NEON | 4 | 4 | 2248.3 | 2.82× |
 | wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
 
-Single-hash latency, cost 4: **646 µs** (criterion, same machine). Throughput
+**AMD EPYC Zen 4** (x86_64, Cloudflare sandbox, 4 vCPU), rustc 1.99.0, cost 5,
+batch 16:
+
+| backend | lanes | hashes/s | vs scalar |
+|---|---|---|---|
+| scalar | 1 | 564.2 | 1.00 |
+| SSE4.1 | 4 | 632.7 | 1.12× |
+| AVX2 | 8 | 869.7 | **1.54×** |
+| AVX-512 | 16 | 798.5 | 1.42× |
+
+AVX-512 loses to AVX2 on Zen 4: its SoA S-boxes are 64 KiB (vs AVX2's 32 KiB,
+exactly L1d-sized) and Zen 4 double-pumps 512-bit ops anyway. Runtime
+dispatch still prefers AVX-512 when present — on Intel hardware with real
+512-bit units the wider kernel should pull ahead; see "Dispatch notes" below.
+
+Single-hash latency, cost 4: **646 µs** (criterion, M5 Max). Throughput
 scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
 
-x86 throughput numbers are deliberately absent: this machine's only x86 paths
-are Rosetta 2 and QEMU TCG, and translation dominates whatever they measure.
-Correctness evidence for every backend is in the matrix below; honest
-hardware numbers for SSE4.1/AVX2/AVX-512 will be added when measured on x86
-hardware.
+### vs the `bcrypt` crate (0.19.3)
+
+Same machine runs of `benches/vs_bcrypt.rs` (criterion; the sanity gate
+asserts both crates produce byte-identical strings before timing). The
+incumbent has no batch API, so its batch arm is the sequential `hash` loop —
+the pattern real callers use today.
+
+**Apple M5 Max:**
+
+| workload | `bcrypt` | `bcrypt-rust` | speedup |
+|---|---|---|---|
+| single hash, cost 4 | 741 µs | 662 µs | 1.12× |
+| single hash, cost 12 | 174.7 ms | 161.2 ms | 1.08× |
+| batch 16, cost 4 | 1411 h/s | 4249 h/s | **3.01×** |
+| batch 16, cost 12 | 5.64 h/s | 17.62 h/s | **3.12×** |
+| verify, cost 4 | 718 µs | 666 µs | 1.08× |
+
+**AMD EPYC Zen 4, 4 vCPU:**
+
+| workload | `bcrypt` | `bcrypt-rust` | speedup |
+|---|---|---|---|
+| single hash, cost 4 | 972 µs | 899 µs | 1.08× |
+| single hash, cost 12 | 239.4 ms | 240.2 ms | 1.00× |
+| batch 16, cost 4 | 905 h/s | 1519 h/s | **1.68×** |
+| batch 16, cost 12 | 4.20 h/s | 6.38 h/s | **1.52×** |
+| verify, cost 4 | 977 µs | 998 µs | 0.98× |
+
+### `parallel` feature (batch 64, Zen 4, 4 vCPU, cost 5)
+
+| configuration | hashes/s | vs 1-core scalar |
+|---|---|---|
+| scalar | 520.9 | 1.00 |
+| AVX2 | 794.5 | 1.53× |
+| scalar + `parallel` | 1983.9 | 3.81× |
+| AVX2 + `parallel` | 2813.4 | **5.40×** |
+
+Chunks are lane-group-aligned, so on AVX-512 the parallel split engages only
+when each worker gets at least one full 16-lane group (`items ≥ cores × 16`);
+a batch of 16 on 4 cores stays single-worker by design.
 
 ### Per-backend verification status
 
@@ -55,8 +105,17 @@ hardware.
 | NEON | 4 | aarch64 | native: full suite + the measurements above (M5 Max) |
 | SSE4.1 | 4 | x86, x86_64 | full suite under Rosetta 2 **and** under QEMU TCG (Debian 12, real cpuid) |
 | AVX2 | 8 | x86_64 | full suite under Rosetta 2 (`+avx2`) and QEMU TCG; the gather-vs-insert shootout asserts both lookup flavors byte-identical before timing |
-| AVX-512 | 16 | x86_64 | **no local execution path exists** (Rosetta SIGILLs AVX-512; QEMU TCG does not emulate it): compile- and clippy-clean, line-by-line review against the executed AVX2 port; unit tests and the cross-backend suite run automatically on AVX-512 hardware, including CI runners that have it |
+| AVX-512 | 16 | x86_64 | full suite on real Zen 4 hardware (Cloudflare sandbox) with `BCRYPT_REQUIRE_BACKEND=avx512` — byte-exact vs scalar, every other backend, and crypt_blowfish C; CI **requires** it on any runner advertising `avx512f` (macOS cannot execute it locally: Rosetta SIGILLs, QEMU TCG has no AVX-512 emulation) |
 | wasm128 | 4 | wasm32 | full suite + micro bench under wasmtime (`+simd128`), scalar-fallback leg without it |
+
+### Dispatch notes
+
+On Zen 4, AVX2 beats AVX-512 by ~8% (working-set and double-pump reasons
+above), but `detect()` prefers AVX-512 wherever `avx512f` exists — the wider
+kernel is the right default for Intel cores with native 512-bit units. If a
+Zen 4 deployment wants the last 8%, force the backend through
+`__internal::bcrypt_many_with_backend` (`internal-api` feature) or run the
+two explicitly and pick per machine, as `benches/micro.rs` does.
 
 ## Quick start
 
