@@ -300,5 +300,7 @@ pub mod __internal {
         pub use crate::eks::neon;
         #[cfg(target_arch = "x86_64")]
         pub use crate::eks::avx2;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        pub use crate::eks::sse41;
     }
 }
