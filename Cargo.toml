@@ -42,9 +42,12 @@ alloc = []
 # password buffers) with a compiler fence that survives `-O3`.
 zeroize = []
 
-# Split large batches across `std::thread::scope` workers. Off by default:
-# worth it only above a measurable batch-size threshold (documented with
-# numbers once the bench suite lands).
+# Split batches of at least 2 x available_parallelism items across
+# `std::thread::scope` workers, chunked on lane-group boundaries. Off by
+# default: a throughput knob for large batches only — single-hash latency is
+# untouched, output is byte-identical to the sequential loop, and below the
+# threshold the sequential loop still runs. `src/core.rs` documents the
+# threshold; the `batch` group in `benches/bcrypt.rs` measures it.
 parallel = ["std"]
 
 # Exposes `bcrypt_rust::__internal` so tests/benches can drive individual
@@ -63,6 +66,27 @@ internal-api = []
 # `internal-api` on, without leaking it into a plain `cargo build`.
 # `default-features = false` keeps `cargo test --no-default-features` honest.
 bcrypt-rust = { path = ".", default-features = false, features = ["internal-api"] }
+
+# Criterion (through rayon) does not build for wasi, and no bench or test
+# target runs there anyway — `cargo test --target wasm32-wasip1` covers the
+# library and the integration tests, never the benches.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+codspeed-criterion-compat = "5.0.1"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+# Publishable criterion benches: single-hash latency, per-backend batch
+# throughput, verify. Run them on a quiet, named machine — the module docs in
+# `benches/bcrypt.rs` say what each group measures and where numbers may go.
+[[bench]]
+name = "bcrypt"
+harness = false
+
+# The CI regression net, measured by CodSpeed's simulation instrument. Small,
+# hermetic and single-threaded on purpose — see the module docs in
+# `benches/codspeed.rs` for why it does not simply reuse the suite above.
+[[bench]]
+name = "codspeed"
+harness = false
 
 # Dependency-free kernel-timing harness (`fn main` parses argv itself, hence
 # `harness = false`). Drives `__internal::bcrypt_many_with_backend`.

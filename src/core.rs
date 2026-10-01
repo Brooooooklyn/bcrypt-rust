@@ -335,9 +335,12 @@ pub fn non_truncating_verify<P: AsRef<[u8]>>(password: P, hash: &str) -> BcryptR
 // Batch API — the SIMD entry points
 // ---------------------------------------------------------------------------
 
-/// The shared chunk loop behind every batch function: `kws[i]`/`sws[i]` are
-/// the pre-digested key and salt words of item `i`; `outs[i]` receives its
-/// 24-byte ciphertext. Preserves input order.
+/// The dispatch point behind every batch function: routes to
+/// [`bcrypt_many_chunked`], the sequential lane-group loop — or, with the
+/// `parallel` feature and a batch of at least the `parallel_workers`
+/// threshold, to the scoped-worker split in `bcrypt_many_scoped`. Either
+/// way `outs[i]` receives item `i`'s 24-byte ciphertext: input order is
+/// preserved, and the outputs are byte-identical across both paths.
 ///
 /// # Safety
 ///
@@ -353,10 +356,41 @@ unsafe fn bcrypt_many_inner(
     sws: &[[u32; 4]],
     outs: &mut [[u8; 24]],
 ) {
-    // TODO(parallel-phase): when the `parallel` feature lands, split the
-    // chunk loop below across `std::thread::scope` workers above a measured
-    // batch-size threshold. The loop is deliberately shape-ready: chunks are
-    // independent and outputs are position-preserving.
+    debug_assert_eq!(kws.len(), sws.len());
+    debug_assert_eq!(kws.len(), outs.len());
+    if kws.is_empty() {
+        return;
+    }
+    #[cfg(feature = "parallel")]
+    {
+        let workers = parallel_workers(kws.len());
+        if workers > 1 {
+            // SAFETY: this function's contract, forwarded; the worker split
+            // writes disjoint index ranges of `outs`.
+            unsafe { bcrypt_many_scoped(backend, cost, kws, sws, outs, workers) };
+            return;
+        }
+    }
+    // SAFETY: this function's contract, forwarded unchanged.
+    unsafe { bcrypt_many_chunked(backend, cost, kws, sws, outs) };
+}
+
+/// The shared chunk loop behind every batch function: `kws[i]`/`sws[i]` are
+/// the pre-digested key and salt words of item `i`; `outs[i]` receives its
+/// 24-byte ciphertext. Preserves input order. Also the per-worker body of
+/// the `parallel` path, which hands each worker a disjoint sub-slice.
+///
+/// # Safety
+///
+/// Same contract as [`bcrypt_many_inner`].
+#[cfg(feature = "alloc")]
+unsafe fn bcrypt_many_chunked(
+    backend: Backend,
+    cost: u32,
+    kws: &[[u32; 18]],
+    sws: &[[u32; 4]],
+    outs: &mut [[u8; 24]],
+) {
     debug_assert_eq!(kws.len(), sws.len());
     debug_assert_eq!(kws.len(), outs.len());
     if kws.is_empty() {
@@ -404,6 +438,122 @@ unsafe fn bcrypt_many_inner(
         wipe_words(sw.as_flattened_mut());
         wipe_bytes(out.as_flattened_mut());
     }
+}
+
+/// Worker count for the `parallel` path: one per available core, and only
+/// when the batch gives every worker at least two items.
+///
+/// Why two items per worker: a scoped spawn+join costs tens of microseconds
+/// on every supported OS, while the cheapest legal bcrypt (cost 4) is a
+/// sub-millisecond unit of work. At one item per worker that fixed cost is a
+/// visible fraction of the work it parallelises; at two it is amortised.
+/// The threshold doubles as the guarantee that small batches run the exact
+/// same sequential loop as a build without this feature. The crossover on a
+/// given machine is what the `batch` group of `benches/bcrypt.rs` measures.
+#[cfg(feature = "parallel")]
+fn parallel_workers(items: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, core::num::NonZero::get);
+    if cores > 1 && items >= 2 * cores { cores } else { 1 }
+}
+
+/// `outs`' base pointer, shared with the scoped workers of
+/// `bcrypt_many_scoped`. Workers claim whole chunks through an atomic
+/// counter, so no two workers ever write the same index; this wrapper is
+/// what lets the pointer cross the `std::thread::scope`.
+#[cfg(feature = "parallel")]
+#[derive(Copy, Clone)]
+struct OutBase(*mut [u8; 24]);
+
+// SAFETY: sound exactly as used by `bcrypt_many_scoped`: chunk claims are
+// unique (`fetch_add`), the claimed ranges are disjoint, and the scope join
+// orders every worker's writes before the caller reads `outs`.
+#[cfg(feature = "parallel")]
+unsafe impl Send for OutBase {}
+// SAFETY: same as the `Send` impl just above.
+#[cfg(feature = "parallel")]
+unsafe impl Sync for OutBase {}
+
+#[cfg(feature = "parallel")]
+impl OutBase {
+    /// The `outs[start]` pointer, for a `start` the caller claimed uniquely.
+    /// A method (rather than field access at the call site) so the scoped
+    /// closure captures this whole `Send` wrapper, not the `!Send` field.
+    ///
+    /// # Safety
+    ///
+    /// `start` must be in bounds, and no other thread may write through the
+    /// returned pointer — in `bcrypt_many_scoped` both come from the
+    /// `fetch_add` chunk claim.
+    unsafe fn at(self, start: usize) -> *mut [u8; 24] {
+        // SAFETY: in-bounds is the caller's documented promise; this only
+        // re-bases the pointer.
+        unsafe { self.0.add(start) }
+    }
+}
+
+/// The `parallel` path: split the batch into lane-aligned chunks and run
+/// [`bcrypt_many_chunked`] on each inside a [`std::thread::scope`]. Claims
+/// are dynamic (an atomic counter), so a worker the OS refuses to spawn
+/// simply means the surviving workers claim its chunks. Output is
+/// byte-identical to the sequential loop: chunking only changes *which*
+/// duplicate lane-padding work is discarded, never an item's output. Wipe
+/// behaviour is unchanged — each worker wipes its own per-group stack
+/// buffers inside the chunk loop, and the caller wipes `key_words` after
+/// the scope has joined.
+///
+/// # Safety
+///
+/// Same contract as [`bcrypt_many_inner`]; every worker forwards `backend`
+/// to the same kernel.
+#[cfg(feature = "parallel")]
+unsafe fn bcrypt_many_scoped(
+    backend: Backend,
+    cost: u32,
+    kws: &[[u32; 18]],
+    sws: &[[u32; 4]],
+    outs: &mut [[u8; 24]],
+    workers: usize,
+) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    debug_assert!(workers > 1);
+    // Whole lane-groups per chunk: a chunk ending mid-group pads its tail
+    // with duplicate work (see `bcrypt_many_chunked`), so ragged boundaries
+    // would pay that padding once per worker instead of once per batch.
+    let per = kws.len().div_ceil(workers).next_multiple_of(backend.lanes());
+    let chunks = kws.len().div_ceil(per);
+
+    let base = OutBase(outs.as_mut_ptr());
+    let next = AtomicUsize::new(0);
+    let next = &next;
+
+    let run = move || loop {
+        // Relaxed: the counter only partitions work. The happens-before the
+        // *data* needs comes from `thread::scope` joining every worker.
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= chunks {
+            return;
+        }
+        let start = i * per;
+        let end = (start + per).min(kws.len());
+        // SAFETY: `i` was claimed exactly once (`fetch_add`), so only this
+        // worker writes `start..end`; `start < kws.len()` because
+        // `i < chunks`.
+        let out = unsafe { core::slice::from_raw_parts_mut(base.at(start), end - start) };
+        // SAFETY: `backend` availability is this function's contract,
+        // forwarded to the chunk loop unchanged.
+        unsafe { bcrypt_many_chunked(backend, cost, &kws[start..end], &sws[start..end], out) };
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            // `Builder::spawn_scoped` returns an error where `scope.spawn`
+            // panics, and this crate must not panic. A refused thread just
+            // means the remaining workers claim its chunks.
+            let _ = std::thread::Builder::new().spawn_scoped(scope, run);
+        }
+        run();
+    });
 }
 
 /// The cost and length validation shared by [`bcrypt_many`] and
@@ -1011,5 +1161,49 @@ mod tests {
         assert_eq!(hash_many(&pws, 3), Err(BcryptError::CostNotAllowed(3)));
         let empty: [&[u8]; 0] = [];
         assert_eq!(hash_many(&empty, 4), Ok(Vec::new()));
+    }
+
+    /// The `2 x cores` threshold: below it the parallel path never engages,
+    /// at it the worker count equals the core count.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_workers_threshold() {
+        let cores = std::thread::available_parallelism().map_or(1, core::num::NonZero::get);
+        assert_eq!(parallel_workers(0), 1);
+        assert_eq!(parallel_workers(2 * cores - 1), 1);
+        // `available_parallelism` never yields 0, so `cores` is also the
+        // expected count when the single-core host stays sequential.
+        assert_eq!(parallel_workers(2 * cores), cores);
+        assert_eq!(parallel_workers(1_000_000), cores);
+    }
+
+    /// The parallel path must be byte-identical to hashing each item on its
+    /// own: chunking only changes which duplicate lane-padding work is
+    /// discarded, never an item's output. The last two sizes sit at and just
+    /// above the `2 x cores` threshold, so the threaded path itself runs on
+    /// any multi-core host.
+    #[cfg(all(feature = "alloc", feature = "parallel"))]
+    #[test]
+    fn parallel_batch_matches_single_hashes() {
+        let cores = std::thread::available_parallelism().map_or(1, core::num::NonZero::get);
+        let sizes = [0usize, 1, 2, 3, 7, 8, 16, 17, 33, 64];
+        for &n in sizes.iter().chain([2 * cores, 2 * cores + 1].iter()) {
+            let store: Vec<Vec<u8>> = (0..n)
+                .map(|i| alloc::vec![(i as u8).wrapping_mul(37); 4 + i % 29])
+                .collect();
+            let pws: Vec<&[u8]> = store.iter().map(Vec::as_slice).collect();
+            let salts: Vec<[u8; 16]> = (0..n)
+                .map(|i| {
+                    let mut s = [0x5Au8; 16];
+                    s[0] = i as u8;
+                    s
+                })
+                .collect();
+            let batch = bcrypt_many(4, &pws, &salts).expect("valid cost");
+            assert_eq!(batch.len(), n);
+            for (i, ((got, &salt), &pw)) in batch.iter().zip(&salts).zip(&pws).enumerate() {
+                assert_eq!(*got, bcrypt(4, salt, pw), "size {n} lane {i}");
+            }
+        }
     }
 }
