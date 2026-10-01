@@ -142,8 +142,10 @@
 // reachable; the link is correct under `--document-private-items` and the
 // module is off-limits to edit, so allow it here rather than churn the docs.
 #![allow(rustdoc::private_intra_doc_links)]
-// The suggested `as_chunks`/`as_chunks_mut` is unstable at the pinned MSRV
-// (rust-version = 1.89), so the lint's fix is not actionable here.
+// clippy suggests `as_chunks`/`as_chunks_mut` (stable since 1.88, so usable at
+// the pinned MSRV 1.89 — this lint fires on stable clippy). Rewriting the
+// verified base64 codec for it is style-only churn, so the lint is allowed
+// crate-wide instead.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 // NOTE FOR EVERY CONTRIBUTOR: this crate has a module named `core`, which
