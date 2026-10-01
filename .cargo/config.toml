@@ -1,0 +1,5 @@
+# Run wasm32-wasip1 tests/benches under wasmtime (mirrors the CI `wasm`
+# job's CARGO_TARGET_WASM32_WASIP1_RUNNER). `--dir=/` preopens the root so
+# the test harness can read what it needs from the host filesystem.
+[target.wasm32-wasip1]
+runner = "wasmtime run --dir=/"

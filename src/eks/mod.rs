@@ -71,16 +71,13 @@ pub mod avx512;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod sse41;
 
-// SIMD backend modules land one per later phase. Each adds its
-// `#[cfg(...)] pub mod <isa>;` here AND flips its arm in `bcrypt_lanes_fn`
-// from `scalar::bcrypt_lanes` to the real kernel in the same commit, so the
-// dispatch table can never claim an ISA while silently running scalar.
-//
-// WebAssembly note for when `wasm128` lands: wasm has no runtime feature
-// detection a module can survive (SIMD instructions fail validation on
-// engines that lack them), so that module exists exactly when
-// `cfg(all(target_arch = "wasm32", target_feature = "simd128"))` held at
-// compile time.
+// WebAssembly has no runtime feature detection a module can survive (SIMD
+// instructions fail validation on engines that lack them), so the module
+// exists exactly when `cfg(all(target_arch = "wasm32", target_feature =
+// "simd128"))` held at compile time — the same condition
+// `have_wasm_simd128` answers from.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub mod wasm128;
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -368,9 +365,8 @@ pub fn backend() -> Backend {
 /// Use [`Backend::is_available`] first, or take the value from [`backend`].
 #[must_use]
 pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
-    // On-arch Neon, Sse41, Avx2 and Avx512 run their real kernels. The
-    // remaining SIMD arm (Wasm128) still resolves to scalar; it flips
-    // its own arm (plus its `pub mod` above) when it lands.
+    // On-arch Neon, Sse41, Avx2, Avx512 and (compile-time-gated) Wasm128
+    // run their real kernels; every off-arch arm resolves to scalar.
     match backend {
         Backend::Scalar => scalar::bcrypt_lanes,
         #[cfg(target_arch = "aarch64")]
@@ -389,6 +385,9 @@ pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
         Backend::Avx512 => avx512::bcrypt_lanes,
         #[cfg(not(target_arch = "x86_64"))]
         Backend::Avx512 => scalar::bcrypt_lanes,
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        Backend::Wasm128 => wasm128::bcrypt_lanes,
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
         Backend::Wasm128 => scalar::bcrypt_lanes,
     }
 }

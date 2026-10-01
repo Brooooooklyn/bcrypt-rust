@@ -304,5 +304,7 @@ pub mod __internal {
         pub use crate::eks::avx512;
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         pub use crate::eks::sse41;
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        pub use crate::eks::wasm128;
     }
 }
