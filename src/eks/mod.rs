@@ -65,6 +65,9 @@ pub mod neon;
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
+#[cfg(target_arch = "x86_64")]
+pub mod avx512;
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod sse41;
 
@@ -365,9 +368,9 @@ pub fn backend() -> Backend {
 /// Use [`Backend::is_available`] first, or take the value from [`backend`].
 #[must_use]
 pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
-    // On-arch Neon, Sse41 and Avx2 run their real kernels. The remaining
-    // SIMD arms still resolve to scalar; each backend flips its own arm
-    // (plus its `pub mod` above) when it lands.
+    // On-arch Neon, Sse41, Avx2 and Avx512 run their real kernels. The
+    // remaining SIMD arm (Wasm128) still resolves to scalar; it flips
+    // its own arm (plus its `pub mod` above) when it lands.
     match backend {
         Backend::Scalar => scalar::bcrypt_lanes,
         #[cfg(target_arch = "aarch64")]
@@ -382,7 +385,11 @@ pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
         Backend::Avx2 => avx2::bcrypt_lanes,
         #[cfg(not(target_arch = "x86_64"))]
         Backend::Avx2 => scalar::bcrypt_lanes,
-        Backend::Avx512 | Backend::Wasm128 => scalar::bcrypt_lanes,
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512 => avx512::bcrypt_lanes,
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Avx512 => scalar::bcrypt_lanes,
+        Backend::Wasm128 => scalar::bcrypt_lanes,
     }
 }
 
