@@ -24,10 +24,15 @@
 //!
 //! If no C compiler can be spawned, every test in this file prints a skip
 //! line and passes (a Windows or minimal container dev box must not go red —
-//! CI's `windows` and `wasm` legs never select this test). A compiler that
-//! exists but fails to build the vendored C, or a harness that misbehaves at
-//! runtime, panics: on the Linux/macOS CI legs that run this test a broken C
-//! build is a real failure and must fail.
+//! CI's `windows` and `wasm` legs never select this test) — unless
+//! `BCRYPT_REQUIRE_C_HARNESS` is set, which turns even that case into a
+//! panic naming the variable. Like `BCRYPT_REQUIRE_BACKEND` in
+//! `tests/backends.rs`, the variable exists so CI legs with a guaranteed
+//! compiler (the `test` and `asan` jobs set it) can never silently skip
+//! the comparison. That no-compiler skip is the ONLY skip: a compiler that
+//! exists but fails to build the vendored C, a failed mkdir/write, or a
+//! harness that misbehaves at runtime panics — on the Linux/macOS CI legs
+//! that run this test a broken C build is a real failure and must fail.
 //!
 //! # Wire protocol
 //!
@@ -241,15 +246,36 @@ const C_SOURCES: [&str; 3] = ["crypt_blowfish.c", "crypt_gensalt.c", "wrapper.c"
 /// glibc-in-tree build, which this never is.)
 const C_HEADERS: [&str; 3] = ["crypt_blowfish.h", "crypt_gensalt.h", "ow-crypt.h"];
 
+/// The only failure [`build_harness`] may return: no C compiler exists on
+/// this host. Every other failure — a missing vendored tree, a failed
+/// mkdir/write, a compile or link error — is a real problem with the test
+/// setup, not an environment to tolerate, so it panics with the details
+/// instead of propagating.
+struct NoCompiler;
+
+impl fmt::Display for NoCompiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("none of $CC/cc/gcc/clang answered `--version`")
+    }
+}
+
 /// Build (once per process) and return the harness executable, or `None`
 /// when no C compiler exists on this host. A missing vendored tree or a
 /// compiler that runs but fails is a panic, not a skip: CI's `test` and
-/// `asan` legs run this file exactly where `cc` is guaranteed.
+/// `asan` legs run this file exactly where `cc` is guaranteed, and they set
+/// `BCRYPT_REQUIRE_C_HARNESS=1`, which turns even the no-compiler case into
+/// a panic — there, a skip can only mean a broken runner. The env check
+/// lives here, outside the `OnceLock`, so it is re-read on every call
+/// rather than frozen by the cached build result.
 fn harness() -> Option<&'static Path> {
-    static BUILT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static BUILT: OnceLock<Result<PathBuf, NoCompiler>> = OnceLock::new();
     match BUILT.get_or_init(build_harness) {
         Ok(path) => Some(path.as_path()),
         Err(why) => {
+            assert!(
+                std::env::var_os("BCRYPT_REQUIRE_C_HARNESS").is_none(),
+                "differential: BCRYPT_REQUIRE_C_HARNESS is set but no usable C compiler: {why}"
+            );
             eprintln!("differential: skipping, no usable C compiler: {why}");
             None
         }
@@ -289,7 +315,7 @@ fn run(what: &str, command: &mut Command) -> Result<(), String> {
     ))
 }
 
-fn build_harness() -> Result<PathBuf, String> {
+fn build_harness() -> Result<PathBuf, NoCompiler> {
     let root = manifest_dir();
     let c_dir = root.join("crypt_blowfish");
     for file in C_SOURCES.iter().chain(C_HEADERS.iter()) {
@@ -299,19 +325,23 @@ fn build_harness() -> Result<PathBuf, String> {
             c_dir.display()
         );
     }
-    let cc = find_compiler().ok_or_else(|| {
-        "none of $CC/cc/gcc/clang answered `--version`".to_string()
-    })?;
+    // The only tolerated absence — everything below this point panics on
+    // failure; see `NoCompiler`.
+    let Some(cc) = find_compiler() else {
+        return Err(NoCompiler);
+    };
 
     let build_dir = root.join("target").join("differential-harness");
-    fs::create_dir_all(&build_dir).map_err(|e| format!("mkdir {}: {e}", build_dir.display()))?;
+    fs::create_dir_all(&build_dir)
+        .unwrap_or_else(|e| panic!("mkdir {}: {e}", build_dir.display()));
 
     let source = build_dir.join("harness.c");
     let stale = fs::read_to_string(&source)
         .map(|s| s != HARNESS_C)
         .unwrap_or(true);
     if stale {
-        fs::write(&source, HARNESS_C).map_err(|e| format!("write {}: {e}", source.display()))?;
+        fs::write(&source, HARNESS_C)
+            .unwrap_or_else(|e| panic!("write {}: {e}", source.display()));
     }
 
     // One object per vendored source, compiled next to the harness (never
@@ -333,7 +363,8 @@ fn build_harness() -> Result<PathBuf, String> {
                     .arg(&src)
                     .arg("-o")
                     .arg(&obj),
-            )?;
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
         }
         objects.push(obj);
     }
@@ -354,7 +385,7 @@ fn build_harness() -> Result<PathBuf, String> {
         link.arg(obj);
     }
     link.arg("-o").arg(&exe);
-    run(&format!("{cc} harness.c *.o"), &mut link)?;
+    run(&format!("{cc} harness.c *.o"), &mut link).unwrap_or_else(|e| panic!("{e}"));
 
     Ok(exe)
 }

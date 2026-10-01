@@ -27,6 +27,11 @@ jobs:
           - os: macos-latest
             require: neon
     runs-on: ${{ matrix.os }}
+    # make + cc are present on all three runners (the release step below
+    # relies on them), so a missing compiler must fail the run, never
+    # silently skip the live-C differential comparison.
+    env:
+      BCRYPT_REQUIRE_C_HARNESS: "1"
     steps:
       - uses: actions/checkout@v7
 
@@ -302,6 +307,8 @@ jobs:
         run: cargo test --release --lib --tests --target ${{ matrix.target }}
         env:
           RUSTFLAGS: -Zsanitizer=address
+          # Both ASan runners have cc; never let the differential skip.
+          BCRYPT_REQUIRE_C_HARNESS: "1"
 
   fuzz:
     name: fuzz (${{ matrix.os }})

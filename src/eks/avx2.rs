@@ -52,6 +52,14 @@
 //! inside the addressed 256-entry box — a gather can never leave the
 //! 32 KiB [`SBoxes8`]. The invariant is stated once here and referenced at
 //! every unsafe dereference below.
+//!
+//! # Zeroization
+//!
+//! With the `zeroize` feature the kernel wipes its named key-material
+//! buffers — the `State8` expansion state, the `kwv` transposed key
+//! schedule and `cdata` — before returning, best-effort like the rest of
+//! the crate: compiler spills and transposition-internal temporaries are
+//! not chased.
 
 use core::arch::x86_64::{
     __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
@@ -427,7 +435,9 @@ unsafe fn bcrypt8<const GATHER: bool>(
     debug_assert_eq!(key_words.len(), LANES);
     debug_assert_eq!(salt_words.len(), LANES);
     debug_assert_eq!(outs.len(), LANES);
-    let kwv = transpose_keys(key_words);
+    // `mut` serves only the `zeroize` wipe at the bottom of this fn.
+    #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+    let mut kwv = transpose_keys(key_words);
     let swv = transpose_salts(salt_words);
     let mut state = State8 {
         p: [_mm256_setzero_si256(); 18],
@@ -477,6 +487,13 @@ unsafe fn bcrypt8<const GATHER: bool>(
         // vectors: 48 exclusively-owned stack words, valid for writes.
         crate::wipe::secure_wipe_u32(unsafe {
             core::slice::from_raw_parts_mut(cdata.as_mut_ptr().cast::<u32>(), 6 * 8)
+        });
+        // `kwv` is the transposed key schedule — all eight lanes'
+        // password-derived key words — so it is wiped with the state.
+        // SAFETY: same reinterpretation as above, for the eighteen `kwv`
+        // vectors: 144 exclusively-owned stack words, valid for writes.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(kwv.as_mut_ptr().cast::<u32>(), 18 * 8)
         });
     }
 }

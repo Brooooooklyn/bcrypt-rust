@@ -27,7 +27,7 @@
 //! * 895 — spelling (c), prescaled per-lane byte offsets.
 //! * 1097 — [`f4_split`]: whole F per lane in GPRs (`ldr [base, w, uxtw
 //!   #2]` gathers), macro-inlined + unrolled rounds, u16 extracts.
-//! * 2253 — [`rounds16_scalar!`]: lanes live in eight GPRs through the 16
+//! * 2253 — `rounds16_scalar!`: lanes live in eight GPRs through the 16
 //!   rounds; no vector register is touched inside the round loop, so the
 //!   insert→extract round trip leaves the dependency chain. Ratio 2.7–2.9×.
 //!
@@ -39,6 +39,14 @@
 //! 256-entry box — a gather can never leave the 16 KiB [`SBoxes4`]. The
 //! invariant is stated once here and referenced at every unsafe
 //! dereference below.
+//!
+//! # Zeroization
+//!
+//! With the `zeroize` feature the kernel wipes its named key-material
+//! buffers — the `State4` expansion state, the `kwv` transposed key
+//! schedule and `cdata` — before returning, best-effort like the rest of
+//! the crate: per-expansion scalar-rounds scratch (the `pw` P-array
+//! snapshot, the lane registers) and compiler spills are not chased.
 
 use core::arch::aarch64::{
     uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, veorq_u32, vgetq_lane_u16, vgetq_lane_u32,
@@ -172,7 +180,7 @@ unsafe fn lookup4_scaled(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
 /// make the [`lookup4`] gathers safe — see the module-level invariant.
 ///
 /// This is the pure-SIMD F: inactive (the P-loops and cdata loop run
-/// [`f4_split`], the S-box loops run [`rounds16_scalar!`] — see the module
+/// [`f4_split`], the S-box loops run `rounds16_scalar!` — see the module
 /// "Tuning summary"), kept as the reference datapath the `lookup4`
 /// spellings hang off, and checked against `f4_split` in the tests.
 #[allow(dead_code)] // tested (f4_variants_agree); see the tuning summary
@@ -253,7 +261,7 @@ fn f4_split(s: &SBoxes4, x: uint32x4_t) -> uint32x4_t {
 /// One lane of the Blowfish round function in scalar code:
 /// `((S0[a] + S1[b]) ^ S2[c]) + S3[d]`, bytes MSB-first, wrapping adds.
 /// Pure GPR code, so it carries no `#[target_feature]` and inlines
-/// anywhere. This is the datapath of [`rounds16_scalar!`].
+/// anywhere. This is the datapath of `rounds16_scalar!`.
 #[inline]
 unsafe fn f_word(s: &SBoxes4, w: u32, lane: usize) -> u32 {
     let a = (w >> 24) as usize;
@@ -583,7 +591,9 @@ unsafe fn bcrypt_lanes_impl(
     debug_assert_eq!(key_words.len(), LANES);
     debug_assert_eq!(salt_words.len(), LANES);
     debug_assert_eq!(outs.len(), LANES);
-    let kwv = transpose_keys(key_words);
+    // `mut` serves only the `zeroize` wipe at the bottom of this fn.
+    #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+    let mut kwv = transpose_keys(key_words);
     let swv = transpose_salts(salt_words);
     let mut state = State4 {
         p: [vdupq_n_u32(0); 18],
@@ -633,6 +643,13 @@ unsafe fn bcrypt_lanes_impl(
         // vectors: 24 exclusively-owned stack words, valid for writes.
         crate::wipe::secure_wipe_u32(unsafe {
             core::slice::from_raw_parts_mut(cdata.as_mut_ptr().cast::<u32>(), 6 * 4)
+        });
+        // `kwv` is the transposed key schedule — all four lanes'
+        // password-derived key words — so it is wiped with the state.
+        // SAFETY: same reinterpretation as above, for the eighteen `kwv`
+        // vectors: 72 exclusively-owned stack words, valid for writes.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(kwv.as_mut_ptr().cast::<u32>(), 18 * 4)
         });
     }
 }

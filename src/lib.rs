@@ -81,7 +81,7 @@
 //! | `alloc` | via `std` | `String`/`Vec` APIs: [`bcrypt_many`], [`hash_many_with_salts`], [`verify_many`], [`HashParts::get_salt`], [`HashParts::format_for_version`] |
 //! | `zeroize` | ✓ | securely wipe internal buffers that held key material (padded passwords, key words, lane scratch) so `-O3` cannot elide the erasure |
 //! | `parallel` | — | split batches of ≥ 2 × available cores across `std::thread::scope` workers; a throughput knob for large batches only — output is byte-identical and the sequential loop runs below the threshold |
-//! | `internal-api` | — | exposes [`__internal`] for this crate's own tests and benches; not stable |
+//! | `internal-api` | — | exposes `__internal` for this crate's own tests and benches; not stable |
 //!
 //! The crate is `#![no_std]` and stays that way with every feature enabled.
 //! With `alloc` but no `std`, everything works except the random-salt

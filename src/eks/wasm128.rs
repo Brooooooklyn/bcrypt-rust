@@ -45,6 +45,14 @@
 //! 256-entry box — a gather can never leave the 16 KiB [`SBoxes4x`]. The
 //! invariant is stated once here and referenced at every unsafe
 //! dereference below.
+//!
+//! # Zeroization
+//!
+//! With the `zeroize` feature the kernel wipes its named key-material
+//! buffers — the `State4x` expansion state, the `kwv` transposed key
+//! schedule and `cdata` — before returning, best-effort like the rest of
+//! the crate: compiler spills and transposition-internal temporaries are
+//! not chased.
 
 use core::arch::wasm32::{
     i32x4_add, u32x4_shr, u32x4_splat, v128, v128_and, v128_load, v128_store, v128_xor,
@@ -347,7 +355,9 @@ unsafe fn bcrypt_lanes_impl(
     debug_assert_eq!(key_words.len(), LANES);
     debug_assert_eq!(salt_words.len(), LANES);
     debug_assert_eq!(outs.len(), LANES);
-    let kwv = transpose_keys(key_words);
+    // `mut` serves only the `zeroize` wipe at the bottom of this fn.
+    #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+    let mut kwv = transpose_keys(key_words);
     let swv = transpose_salts(salt_words);
     let mut state = State4x {
         p: [u32x4_splat(0); 18],
@@ -397,6 +407,13 @@ unsafe fn bcrypt_lanes_impl(
         // vectors: 24 exclusively-owned stack words, valid for writes.
         crate::wipe::secure_wipe_u32(unsafe {
             core::slice::from_raw_parts_mut(cdata.as_mut_ptr().cast::<u32>(), 6 * 4)
+        });
+        // `kwv` is the transposed key schedule — all four lanes'
+        // password-derived key words — so it is wiped with the state.
+        // SAFETY: same reinterpretation as above, for the eighteen `kwv`
+        // vectors: 72 exclusively-owned stack words, valid for writes.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(kwv.as_mut_ptr().cast::<u32>(), 18 * 4)
         });
     }
 }
