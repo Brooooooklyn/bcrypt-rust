@@ -2,8 +2,8 @@
 
 Date: 2026-10-01. Status: approved-by-user-brief ("a full SIMD optimized bcrypt implementation
 like argon2"). Mirrors the architecture of `/Users/brooklyn/workspace/github/argon2-rust`
-(v1.1.0). Research inputs: `/tmp/argon2-arch-report.md`, `/tmp/bcrypt-simd-research.md`,
-`/tmp/rust-bcrypt-crates.md`.
+(v1.1.0). Research inputs: `docs/research/argon2-arch-report.md`, `docs/research/bcrypt-simd-research.md`,
+`docs/research/rust-bcrypt-crates.md`.
 
 ## 1. The one fact that shapes everything
 

@@ -1,7 +1,7 @@
 //! The authoritative bcrypt test-vector suite.
 //!
 //! Vectors are transcribed from the consolidated table in the ecosystem
-//! survey (`/tmp/rust-bcrypt-crates.md` §6). Sources:
+//! survey (`docs/research/rust-bcrypt-crates.md` §6). Sources:
 //!
 //! * **JB** — jBCrypt `TestBCrypt.java` (djmdjm/jBCrypt), 20 vectors;
 //! * **OW** — Openwall `crypt_blowfish-1.3` `wrapper.c` self-test array

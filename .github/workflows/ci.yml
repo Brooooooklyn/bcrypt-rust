@@ -17,7 +17,9 @@ jobs:
         # ubuntu-24.04-arm is the GitHub-hosted Linux aarch64 runner; together
         # with macos-latest it is the CI coverage of the NEON backend.
         # ubuntu-latest (x86_64) covers Sse41 and AVX2 (GitHub runners have
-        # had AVX2 for years); AVX-512 runs only where the runner has it.
+        # had AVX2 for years); AVX-512 is REQUIRED on runners that advertise
+        # avx512f (see the pick step below), so the 16-lane kernel executes
+        # for real wherever the runner lottery provides the hardware.
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         include:
           - os: ubuntu-latest
@@ -43,10 +45,29 @@ jobs:
       # vendored crypt_blowfish (needs make + cc, present on all three runners).
       # BCRYPT_REQUIRE_BACKEND turns a silently-skipped backend into a failure,
       # so the log proves the named backend actually executed on this runner.
+      # ubuntu-latest runners are a hardware lottery: when the runner
+      # advertises avx512f the AVX-512 backend is required (never just
+      # opportunistic); otherwise AVX2 is required. NEON always on aarch64.
+      - name: pick the backend this runner must execute
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              if grep -qw avx512f /proc/cpuinfo; then
+                echo "BCRYPT_REQUIRE_BACKEND=avx512" >> "$GITHUB_ENV"
+                echo "runner advertises avx512f: requiring the AVX-512 backend"
+              else
+                echo "BCRYPT_REQUIRE_BACKEND=avx2" >> "$GITHUB_ENV"
+                echo "no avx512f on this runner: requiring AVX2"
+              fi
+              ;;
+            *)
+              echo "BCRYPT_REQUIRE_BACKEND=${{ matrix.require }}" >> "$GITHUB_ENV"
+              echo "requiring ${{ matrix.require }}"
+              ;;
+          esac
+
       - name: cargo test (release)
         run: cargo test --release
-        env:
-          BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
 
       - name: cargo test (debug)
         run: cargo test
