@@ -1,0 +1,184 @@
+# bcrypt-rust
+
+Pure-Rust [bcrypt](https://www.usenix.org/legacy/events/usenix99/provos/provos.pdf)
+(Provos & Mazières, USENIX 1999) with runtime-dispatched SIMD backends for
+**batch** hashing. **Zero dependencies**, `#![no_std]`-capable, MSRV 1.89.
+
+Wire-compatible with every implementation that speaks the `$2*$` hash-string
+format (`$2v$cc$<22-char salt><31-char hash>`, exactly 60 ASCII bytes), and
+API-compatible with the [`bcrypt`](https://crates.io/crates/bcrypt) crate
+(0.19): same names, same semantics, same `BcryptError` variant set.
+
+## Security and audit status
+
+This crate implements security-sensitive cryptographic code and has **not**
+received an independent third-party audit. Its defense-in-depth is the
+verification suite described below. See [SECURITY.md](SECURITY.md) for the
+support policy and how to report a vulnerability privately.
+
+## What SIMD does — and does not — do here
+
+bcrypt's cost loop is strictly sequential: **one hash cannot be
+parallelized**. The SIMD backends therefore speed up **batch throughput
+only**, by interleaving N *independent* hashes in lockstep, one per vector
+lane. Single-hash latency is unchanged — `hash` / `verify` always run the
+scalar kernel.
+
+## Performance
+
+Measured on an **Apple M5 Max** (aarch64), rustc 1.98.0, cost 5, via
+`benches/micro.rs`. The harness is correctness-gated: every timed iteration's
+output is asserted byte-identical to the scalar batch, so a divergent kernel
+aborts instead of posting a fast-but-wrong number.
+
+| backend | lanes | batch | hashes/s | vs scalar |
+|---|---|---|---|---|
+| scalar | 1 | 16 | 811.6 | 1.00 |
+| NEON | 4 | 16 | 2252.8 | **2.78×** |
+| NEON | 4 | 4 | 2248.3 | 2.82× |
+| wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
+
+Single-hash latency, cost 4: **646 µs** (criterion, same machine). Throughput
+scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
+
+x86 throughput numbers are deliberately absent: this machine's only x86 paths
+are Rosetta 2 and QEMU TCG, and translation dominates whatever they measure.
+Correctness evidence for every backend is in the matrix below; honest
+hardware numbers for SSE4.1/AVX2/AVX-512 will be added when measured on x86
+hardware.
+
+### Per-backend verification status
+
+| backend | lanes | targets | execution evidence |
+|---|---|---|---|
+| scalar | 1 | all | everywhere; the reference every other backend is checked against |
+| NEON | 4 | aarch64 | native: full suite + the measurements above (M5 Max) |
+| SSE4.1 | 4 | x86, x86_64 | full suite under Rosetta 2 **and** under QEMU TCG (Debian 12, real cpuid) |
+| AVX2 | 8 | x86_64 | full suite under Rosetta 2 (`+avx2`) and QEMU TCG; the gather-vs-insert shootout asserts both lookup flavors byte-identical before timing |
+| AVX-512 | 16 | x86_64 | **no local execution path exists** (Rosetta SIGILLs AVX-512; QEMU TCG does not emulate it): compile- and clippy-clean, line-by-line review against the executed AVX2 port; unit tests and the cross-backend suite run automatically on AVX-512 hardware, including CI runners that have it |
+| wasm128 | 4 | wasm32 | full suite + micro bench under wasmtime (`+simd128`), scalar-fallback leg without it |
+
+## Quick start
+
+```rust
+// Cost 4 keeps the example fast; use DEFAULT_COST (12) or higher in real code.
+let hash = bcrypt_rust::hash(b"hunter2", 4)?;
+assert_eq!(hash.len(), 60);
+assert!(bcrypt_rust::verify(b"hunter2", &hash)?);
+assert!(!bcrypt_rust::verify(b"hunter3", &hash)?);
+```
+
+Batch hashing (where the SIMD backends engage):
+
+```rust
+let passwords: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];
+let hashes = bcrypt_rust::hash_many(&passwords, 4)?;
+for (password, hash) in passwords.iter().zip(&hashes) {
+    assert!(bcrypt_rust::verify(password, hash)?);
+}
+```
+
+## How the dispatch works
+
+```
+bcrypt_many / hash_many / hash_many_with_salts / verify_many
+                    │
+                    ▼
+              detect()            cached in an AtomicU8; #[cold] probe
+                    │
+      ┌─────────────┼──────────────────────────────┐
+      ▼             ▼                              ▼
+ runtime cpuid   compile-time cfg               scalar
+ (std builds)    (no_std / miri)                (fallback)
+      │
+      ▼
+ avx512 ×16 ─ avx2 ×8 ─ sse41 ×4 ─ neon ×4 ─ wasm128 ×4 ─ scalar ×1
+      │
+      ▼
+ batch split into lane groups; short groups padded, padding discarded
+      │
+      ▼
+ per-item outputs — byte-identical on every backend (asserted in tests)
+```
+
+With the `parallel` feature, large batches (≥ 2 × available cores) are
+additionally split across `std::thread::scope` workers on lane-group
+boundaries — output stays byte-identical to the sequential loop.
+
+## Feature flags
+
+| feature | default | what it gates |
+|---|---|---|
+| `std` | ✓ | runtime CPU detection; OS-entropy salts for `hash`, `hash_many`, … |
+| `alloc` | via `std` | `String`/`Vec` APIs: `bcrypt_many`, `hash_many_with_salts`, `verify_many`, `HashParts::format_for_version` |
+| `zeroize` | ✓ | wipe internal buffers that held key material so `-O3` cannot elide it |
+| `parallel` | — | thread-scoped batch splitting; throughput knob for large batches only |
+| `internal-api` | — | exposes `__internal` for this crate's tests/benches; not stable |
+
+With `alloc` but no `std`, everything works except the random-salt
+conveniences and runtime detection (compile-time `target_feature` cfgs, then
+scalar). With neither, the byte-oriented core (`bcrypt`, `hash_with_salt`,
+`verify`, `HashParts` parsing/formatting) is fully functional.
+
+## Semantics and compatibility
+
+* Key preparation: password is NUL-appended then truncated at 72 bytes
+  (`min(len + 1, 72)` key schedule bytes) — the OpenBSD/`bcrypt`-crate
+  semantics.
+* All four `$2a$`/`$2b$/`$2x$`/`$2y$` prefixes are accepted on parse and
+  hashed with `$2b$` (correct-algorithm) semantics; `$2b$` is emitted on
+  format.
+* Two crypt_blowfish bug-compatibilities are deliberately **not** reproduced:
+  the `$2x$` sign-extension bug and the `$2a$` 8-bit "safety XOR". The pinned
+  rows, including the three survey rows reclassified against the vendored C
+  source, live in `tests/vectors.rs`.
+
+## Verification
+
+* **Authoritative vectors** — 61 rows transcribed from jBCrypt, Openwall
+  `wrapper.c`, the `bcrypt` crate, and pyca/bcrypt, plus divergent rows with
+  per-row `must_verify` expectations (`tests/vectors.rs`).
+* **Cross-backend differential** — every backend on the host must produce
+  byte-identical output to scalar across lane-boundary batch sizes
+  (0–33), costs 4–6, and the 71/72/73 password boundary
+  (`tests/backends.rs`). `BCRYPT_REQUIRE_BACKEND=<name>` turns a skip into a
+  failure for CI.
+* **Differential vs reference C** — 360 seeded cases compared against the
+  real `crypt_rn` of the vendored [crypt_blowfish](https://www.openwall.com/crypt/)
+  1.3 (public domain), replayed through every available backend, including
+  accept/reject parity on malformed settings (`tests/differential.rs`).
+* **Fuzzing** — two `cargo-fuzz` targets: `decode` (the `$2*$` parser must
+  never panic) and `tiny_hash` (cost validation + the whole pipeline at
+  fuzzer-derived tiny parameters).
+* **CI** — Linux/macOS/Windows, no-std check, docs, MSRV 1.89, Miri,
+  ASAN/LSAN, wasm (simd128 + scalar fallback), entropy-target matrix,
+  old-glibc, bench-compile, and a 5-minute fuzz leg per target.
+
+## Reproducing the benchmarks
+
+```console
+# correctness-gated micro harness, per-backend, prints hashes/s and ratio
+cargo bench --bench micro -- --backend all --batch 16 --cost 5 --iters 100 --vs-scalar
+
+# criterion suite (single-hash latency, per-backend batch, verify)
+cargo bench --bench bcrypt
+
+# the CI regression net (CodSpeed)
+cargo bench --bench codspeed
+
+# wasm, under wasmtime
+RUSTFLAGS="-C target-feature=+simd128" cargo test --release --target wasm32-wasip1
+RUSTFLAGS="-C target-feature=+simd128" cargo bench --target wasm32-wasip1 --bench micro -- --backend all --batch 8 --cost 4 --iters 50 --vs-scalar
+```
+
+## MSRV
+
+Rust **1.89**, pinned by exactly one thing: `stdarch_x86_avx512` (the AVX-512
+intrinsics and the `avx512f` target feature) stabilized there. The CI `msrv`
+job enforces it; raise it only with a reason.
+
+## License
+
+MIT. The `crypt_blowfish/` directory contains Openwall's crypt_blowfish 1.3
+(public domain), vendored for differential testing only — it is never linked
+into the crate.

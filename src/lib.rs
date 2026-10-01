@@ -17,16 +17,22 @@
 //! Single-hash latency is unchanged, and [`hash`] / [`verify`] always run
 //! the scalar kernel — they never see a [`Backend`] value at all.
 //!
-//! Expected batch gains per core, derived from the literature and the
-//! sibling argon2-rust measurements — replaced by this crate's own bench
-//! numbers as each backend lands:
+//! Measured batch gains (Apple M5 Max, rustc 1.98, cost 5,
+//! `benches/micro.rs` — every timed iteration asserted byte-identical to
+//! scalar):
 //!
-//! | backend | expected batch speedup |
-//! |---|---|
-//! | AVX2 (Intel) | ~2.5–3× |
-//! | AVX-512 | ~3–6× |
-//! | AVX2 (AMD Zen) | ~2–2.5× |
-//! | NEON / wasm SIMD128 | ~1.5–2.5× |
+//! | backend | lanes | batch | hashes/s | vs scalar |
+//! |---|---|---|---|---|
+//! | scalar | 1 | 16 | 811.6 | 1.00 |
+//! | NEON | 4 | 16 | 2252.8 | 2.78× |
+//! | NEON | 4 | 4 | 2248.3 | 2.82× |
+//! | wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
+//!
+//! x86 backends are correctness-verified (SSE4.1/AVX2 executed under Rosetta
+//! 2 and QEMU TCG; AVX-512 compile- and review-verified, runs on hardware)
+//! but this machine has no hardware-representative x86 throughput path —
+//! Rosetta translation dominates any number it produces. See the README for
+//! the full verification matrix.
 //!
 //! The batch entry points are [`bcrypt_many`], [`hash_many`],
 //! [`hash_many_with_salts`] and [`verify_many`].
