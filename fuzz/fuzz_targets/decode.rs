@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 /// A string the parser ACCEPTS with a large cost costs a full bcrypt per fuzz
 /// iteration, which starves the fuzzer. Pre-filter those cheaply: this is NOT
-//! the real parser, it just caps work on inputs that look valid-and-big; a
+/// the real parser, it just caps work on inputs that look valid-and-big; a
 /// mismatch only costs one slow iteration.
 fn looks_expensive(s: &str) -> bool {
     // "$2b$12$..." — cost digits live at [4..6] in an otherwise-valid string.
