@@ -240,6 +240,8 @@ pub mod __internal {
     //! `#![forbid(unsafe_code)]` program reachable by UB.
 
     pub use crate::core::constant_time_eq;
+    #[cfg(feature = "alloc")]
+    pub use crate::core::bcrypt_many_with_backend;
     pub use crate::eks::scalar;
     pub use crate::eks::{Backend, BcryptLanesFn, backend, bcrypt_lanes_fn, detect};
     pub use crate::encoding::HashParts;
@@ -294,5 +296,7 @@ pub mod __internal {
     /// test can pit two backends against each other on the same inputs.
     pub mod backends {
         pub use crate::eks::scalar;
+        #[cfg(target_arch = "aarch64")]
+        pub use crate::eks::neon;
     }
 }

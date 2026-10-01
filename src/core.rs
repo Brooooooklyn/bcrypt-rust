@@ -20,6 +20,8 @@ use alloc::string::String;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "alloc")]
+use crate::eks::Backend;
 use crate::encoding::{HashParts, Version};
 use crate::error::{BcryptError, BcryptResult};
 
@@ -336,8 +338,21 @@ pub fn non_truncating_verify<P: AsRef<[u8]>>(password: P, hash: &str) -> BcryptR
 /// The shared chunk loop behind every batch function: `kws[i]`/`sws[i]` are
 /// the pre-digested key and salt words of item `i`; `outs[i]` receives its
 /// 24-byte ciphertext. Preserves input order.
+///
+/// # Safety
+///
+/// `backend.is_available()` must hold on this CPU: the resolved kernel is a
+/// `#[target_feature]` function and there is no fallback at this level.
+/// Safe callers pass `crate::eks::backend()`, which by construction only
+/// ever names a backend this CPU advertises.
 #[cfg(feature = "alloc")]
-fn bcrypt_many_inner(cost: u32, kws: &[[u32; 18]], sws: &[[u32; 4]], outs: &mut [[u8; 24]]) {
+unsafe fn bcrypt_many_inner(
+    backend: Backend,
+    cost: u32,
+    kws: &[[u32; 18]],
+    sws: &[[u32; 4]],
+    outs: &mut [[u8; 24]],
+) {
     // TODO(parallel-phase): when the `parallel` feature lands, split the
     // chunk loop below across `std::thread::scope` workers above a measured
     // batch-size threshold. The loop is deliberately shape-ready: chunks are
@@ -347,9 +362,9 @@ fn bcrypt_many_inner(cost: u32, kws: &[[u32; 18]], sws: &[[u32; 4]], outs: &mut 
     if kws.is_empty() {
         return;
     }
-    // One dispatch for the whole batch: resolve the backend and its kernel
-    // pointer before entering the loop; nothing dispatches per chunk.
-    let backend = crate::eks::backend();
+    // One dispatch for the whole batch: the caller picked `backend`; resolve
+    // its kernel pointer before entering the loop — nothing dispatches per
+    // chunk.
     let kernel = crate::eks::bcrypt_lanes_fn(backend);
     let lanes = backend.lanes();
     // The stack arrays are sized for the widest backend that exists
@@ -376,11 +391,12 @@ fn bcrypt_many_inner(cost: u32, kws: &[[u32; 18]], sws: &[[u32; 4]], outs: &mut 
         for slot in &mut sw[group..lanes] {
             *slot = fill_sw;
         }
-        // SAFETY: `kernel` came from `crate::eks::backend()`, so this CPU
-        // supports the instruction set it targets. All three slices are
-        // exactly `lanes` long, as the kernel contract requires, and `out`
-        // is a stack array exclusively owned by this frame — nothing else
-        // aliases it for the duration of the call.
+        // SAFETY: `backend` is available on this CPU (this function's
+        // contract), so this CPU supports the instruction set `kernel`
+        // targets. All three slices are exactly `lanes` long, as the kernel
+        // contract requires, and `out` is a stack array exclusively owned
+        // by this frame — nothing else aliases it for the duration of the
+        // call.
         unsafe { kernel(cost, &kw[..lanes], &sw[..lanes], &mut out[..lanes]) };
         outs[base..base + group].copy_from_slice(&out[..group]);
         base += group;
@@ -388,6 +404,35 @@ fn bcrypt_many_inner(cost: u32, kws: &[[u32; 18]], sws: &[[u32; 4]], outs: &mut 
         wipe_words(sw.as_flattened_mut());
         wipe_bytes(out.as_flattened_mut());
     }
+}
+
+/// The cost and length validation shared by [`bcrypt_many`] and
+/// [`bcrypt_many_with_backend`].
+#[cfg(feature = "alloc")]
+fn check_batch(cost: u32, passwords: &[&[u8]], salts: &[[u8; 16]]) -> BcryptResult<()> {
+    check_cost(cost)?;
+    if passwords.len() != salts.len() {
+        return Err(BcryptError::BatchLengthMismatch {
+            passwords: passwords.len(),
+            salts: salts.len(),
+        });
+    }
+    Ok(())
+}
+
+/// The key/salt word digestion shared by [`bcrypt_many`] and
+/// [`bcrypt_many_with_backend`].
+#[cfg(feature = "alloc")]
+fn prep_words(passwords: &[&[u8]], salts: &[[u8; 16]]) -> (Vec<[u32; 18]>, Vec<[u32; 4]>) {
+    let mut key_words: Vec<[u32; 18]> = Vec::with_capacity(passwords.len());
+    let mut salt_words: Vec<[u32; 4]> = Vec::with_capacity(salts.len());
+    for (password, salt) in passwords.iter().zip(salts) {
+        let (mut key, key_len) = padded_key(password);
+        key_words.push(crate::eks::expand_key_words(&key, key_len));
+        wipe_key(&mut key);
+        salt_words.push(crate::eks::salt_words(salt));
+    }
+    (key_words, salt_words)
 }
 
 /// Batch-hash passwords at one cost with caller-supplied salts, returning the
@@ -409,23 +454,81 @@ pub fn bcrypt_many(
     passwords: &[&[u8]],
     salts: &[[u8; 16]],
 ) -> BcryptResult<Vec<[u8; 24]>> {
-    check_cost(cost)?;
-    if passwords.len() != salts.len() {
-        return Err(BcryptError::BatchLengthMismatch {
-            passwords: passwords.len(),
-            salts: salts.len(),
-        });
-    }
-    let mut key_words: Vec<[u32; 18]> = Vec::with_capacity(passwords.len());
-    let mut salt_words: Vec<[u32; 4]> = Vec::with_capacity(salts.len());
-    for (password, salt) in passwords.iter().zip(salts) {
-        let (mut key, key_len) = padded_key(password);
-        key_words.push(crate::eks::expand_key_words(&key, key_len));
-        wipe_key(&mut key);
-        salt_words.push(crate::eks::salt_words(salt));
-    }
+    check_batch(cost, passwords, salts)?;
+    let (mut key_words, salt_words) = prep_words(passwords, salts);
     let mut outs = alloc::vec![[0u8; 24]; passwords.len()];
-    bcrypt_many_inner(cost, &key_words, &salt_words, &mut outs);
+    // SAFETY: `crate::eks::backend()` only ever names a backend this CPU
+    // advertises, which is the whole contract `bcrypt_many_inner` asks for.
+    unsafe { bcrypt_many_inner(crate::eks::backend(), cost, &key_words, &salt_words, &mut outs) };
+    wipe_words(key_words.as_flattened_mut());
+    Ok(outs)
+}
+
+/// [`bcrypt_many`] with the backend chosen by the caller instead of the
+/// runtime cascade — the differential-testing hook behind `internal-api`.
+///
+/// Everything else (cost and length validation, key preparation, output
+/// order, empty-batch behaviour) is identical to [`bcrypt_many`].
+///
+/// # Safety
+///
+/// The caller must ensure `backend.is_available()` holds on this CPU: the
+/// resolved kernel is a `#[target_feature]` function and calling it without
+/// its instruction set is undefined behaviour (`SIGILL` in practice). Note
+/// that an off-architecture backend resolves to the scalar kernel, so on an
+/// off-arch build any backend is *sound* to pass — but that is not the
+/// contract, and on-arch it will fault.
+///
+/// # Errors
+///
+/// Same as [`bcrypt_many`].
+///
+/// # Examples
+///
+/// Check availability, then make the safety promise:
+///
+/// ```
+/// use bcrypt_rust::{Backend, BcryptResult};
+/// use bcrypt_rust::__internal::bcrypt_many_with_backend;
+///
+/// # fn run() -> BcryptResult<()> {
+/// let backend = Backend::Scalar; // always available
+/// assert!(backend.is_available());
+/// let passwords: [&[u8]; 2] = [b"alpha", b"bravo"];
+/// let salts = [[7u8; 16], [9u8; 16]];
+/// // SAFETY: `backend.is_available()` was asserted just above.
+/// let outs = unsafe { bcrypt_many_with_backend(backend, 4, &passwords, &salts)? };
+/// assert_eq!(outs.len(), 2);
+/// #     Ok(())
+/// # }
+/// # run().unwrap();
+/// ```
+///
+/// The promise is required — this does not compile:
+///
+/// ```compile_fail
+/// use bcrypt_rust::Backend;
+/// use bcrypt_rust::__internal::bcrypt_many_with_backend;
+///
+/// let passwords: [&[u8]; 1] = [b"alpha"];
+/// let salts = [[7u8; 16]];
+/// // ERROR: call to an unsafe function requires an unsafe block.
+/// let _ = bcrypt_many_with_backend(Backend::Scalar, 4, &passwords, &salts);
+/// ```
+#[cfg(all(feature = "internal-api", feature = "alloc"))]
+pub unsafe fn bcrypt_many_with_backend(
+    backend: Backend,
+    cost: u32,
+    passwords: &[&[u8]],
+    salts: &[[u8; 16]],
+) -> BcryptResult<Vec<[u8; 24]>> {
+    check_batch(cost, passwords, salts)?;
+    let (mut key_words, salt_words) = prep_words(passwords, salts);
+    let mut outs = alloc::vec![[0u8; 24]; passwords.len()];
+    // SAFETY: the caller guarantees `backend.is_available()` — this
+    // function's documented safety contract, forwarded to
+    // `bcrypt_many_inner` unchanged.
+    unsafe { bcrypt_many_inner(backend, cost, &key_words, &salt_words, &mut outs) };
     wipe_words(key_words.as_flattened_mut());
     Ok(outs)
 }
@@ -542,7 +645,9 @@ pub fn verify_many(passwords: &[&[u8]], hashes: &[&str]) -> Vec<BcryptResult<boo
             salt_words.push(crate::eks::salt_words(&salt));
         }
         let mut outs = alloc::vec![[0u8; 24]; items.len()];
-        bcrypt_many_inner(*cost, &key_words, &salt_words, &mut outs);
+        // SAFETY: same as in `bcrypt_many` — `crate::eks::backend()` only
+        // names a backend this CPU advertises.
+        unsafe { bcrypt_many_inner(crate::eks::backend(), *cost, &key_words, &salt_words, &mut outs) };
         for (j, &(i, _, expected)) in items.iter().enumerate() {
             let mut computed = [0u8; 23];
             computed.copy_from_slice(&outs[j][..23]);
