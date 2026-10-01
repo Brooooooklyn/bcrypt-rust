@@ -1,0 +1,368 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is the GitHub-hosted Linux aarch64 runner; together
+        # with macos-latest it is the CI coverage of the NEON backend.
+        # ubuntu-latest (x86_64) covers Sse41 and AVX2 (GitHub runners have
+        # had AVX2 for years); AVX-512 runs only where the runner has it.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        include:
+          - os: ubuntu-latest
+            require: avx2
+          - os: ubuntu-24.04-arm
+            require: neon
+          - os: macos-latest
+            require: neon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Full suite: vectors, cross-backend equality, live differential vs the
+      # vendored crypt_blowfish (needs make + cc, present on all three runners).
+      # BCRYPT_REQUIRE_BACKEND turns a silently-skipped backend into a failure,
+      # so the log proves the named backend actually executed on this runner.
+      - name: cargo test (release)
+        run: cargo test --release
+        env:
+          BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
+
+      - name: cargo test (debug)
+        run: cargo test
+
+      - name: cargo test (--no-default-features)
+        run: cargo test --release --no-default-features
+
+      - name: cargo test (--all-features)
+        run: cargo test --release --all-features
+
+  windows:
+    name: build + tests (windows ${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          # 32-bit matters for more than coverage arithmetic: on x86 Windows
+          # `extern "system"` is `__stdcall` and decorates the symbol, so an FFI
+          # declaration that is merely `extern "C"` links fine on x86_64 and
+          # fails only here. `src/random.rs` (ported from argon2-rust) had
+          # exactly that bug there. The runner is x86_64, so this leg
+          # cross-compiles and runs the i686 binary under WOW64 — which Windows
+          # does natively.
+          - arch: i686
+            target: i686-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # The differential integration test needs make + cc; unit tests cover the
+      # kernels and core logic on Windows.
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo test --release --target ${{ matrix.target }} --lib
+      # `vectors` is what actually *calls* ProcessPrng (via `hash`). Without a
+      # call the import is never resolved and the ABI would go untested.
+      - run: cargo test --release --target ${{ matrix.target }} --test vectors
+
+  no-std:
+    name: no_std build (thumbv7em-none-eabi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+      - run: cargo build --release --no-default-features --target thumbv7em-none-eabi
+
+  docs:
+    name: rustdoc (default and all features, warnings denied)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Public-to-private intra-doc links render in local private-item builds but
+      # fail on docs.rs. Denying warnings keeps the published surface honest.
+      - name: Default features
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: All features
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    # `rust-version` is a promise to downstream: Cargo hard-refuses the crate on
+    # anything older, so a number sitting above the true floor locks users out
+    # for nothing. Read the floor out of the manifest instead of hardcoding it
+    # here — two copies of a version number are two things to forget to update,
+    # and the copy that actually gates users is the manifest's.
+    #
+    # One thing sets the floor: `stdarch_x86_avx512` (the AVX-512 intrinsics and
+    # the `avx512f` target feature) stabilized in 1.89. That is why the x86_64
+    # leg is not optional — `src/eks/avx512.rs` is cfg'd out everywhere else.
+    # The aarch64 leg is here for the NEON backend for the same reason.
+    name: msrv (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          v=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          test -n "$v" || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "MSRV declared in Cargo.toml: $v"
+
+      # `@master` rather than `@stable`: the version aliases are fixed refs and
+      # cannot accept a computed toolchain.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A real `build`, not just `check`, so the SIMD backends go through
+      # codegen — `#[target_feature]` and the intrinsics are where an old rustc
+      # breaks.
+      - run: cargo build --release --all-features
+
+      # `check`, not `test`: dev-dependencies are not part of the promise to
+      # downstream, so criterion raising *its* MSRV must not fail this job.
+      - run: cargo check --no-default-features
+
+  entropy-target-matrix:
+    name: builds where there is no entropy source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip1, wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      # `src/random.rs` must never make a target uncompilable just because it
+      # has no entropy backend. `wasm32-unknown-unknown` is exactly such a
+      # target and is the cheapest one to keep in CI.
+      - run: cargo check --release --target wasm32-unknown-unknown
+      # All three WASI previews report `target_os = "wasi"` and differ only in
+      # `target_env`. p1 imports `wasi_snapshot_preview1::random_get`; p2 and p3
+      # must NOT, because their entropy is a component-model interface. These
+      # legs pin that the cfg split keeps compiling for both.
+      - run: cargo check --release --target wasm32-wasip1
+      - run: cargo check --release --target wasm32-wasip2
+
+  old-glibc:
+    name: link + run on glibc 2.17 (manylinux2014)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # `src/random.rs` must not name a libc symbol that only exists in newer
+      # glibc. The `getrandom` wrapper arrived in 2.25 — declaring it would
+      # fail to LINK here, where no runtime fallback can help. `syscall(2)`
+      # has always been there.
+      #
+      # Deliberately a `docker run` rather than a job-level `container:`:
+      # GitHub's container support injects a node20 runner, which needs glibc
+      # 2.28 and cannot start here.
+      - name: build and run inside manylinux2014
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            quay.io/pypa/manylinux2014_x86_64 bash -euo pipefail -c '
+              # NOT `| head -1`: head exits after the first line while ldd is
+              # still writing the rest, so ldd takes a SIGPIPE, `pipefail` turns
+              # that into 141 and `-e` kills the job before curl ever runs.
+              # `sed -n 1p` reads to EOF.
+              ldd --version | sed -n 1p
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              export CARGO_TARGET_DIR=/tmp/target
+              cargo build --release
+              # Building is not enough: the symbol has to resolve at link time
+              # and the code has to actually run, so link and execute a binary
+              # that calls the entropy path.
+              cargo test --release --test vectors
+            '
+
+  wasm:
+    name: wasm (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: wasip1, simd128
+            target: wasm32-wasip1
+            runner: wasmtime run --dir=/
+            features: +simd128
+            require: wasm128
+            suites: --test vectors --test backends
+          - name: wasip1, scalar fallback
+            target: wasm32-wasip1
+            runner: wasmtime run --dir=/
+            features: -simd128
+            require: ""
+            suites: --test vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime
+      # differential is excluded (it needs make + cc). The simd128 leg requires
+      # the wasm128 backend to actually run; the scalar leg proves the fallback.
+      - name: cargo test
+        run: cargo test --release --target ${{ matrix.target }} --lib ${{ matrix.suites }}
+        env:
+          RUSTFLAGS: -C target-feature=${{ matrix.features }}
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: ${{ matrix.runner }}
+          BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
+
+  benches-compile:
+    name: benches compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --benches --features internal-api
+
+  # The SIMD paths are platform-independent in behaviour (cross-backend
+  # equality-verified), so the sanitizer-style jobs run on both arches:
+  # x86_64-linux covers the SSE4.1/AVX2(/AVX-512) builds, aarch64-mac covers
+  # the NEON build. Under Miri, detect() returns Scalar on every host (see
+  # eks/mod.rs), which is what makes the Miri job arch-independent.
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Scoped to --lib on purpose: the unit tests exercise the unsafe wipe
+      # and the scalar kernel at Miri-feasible costs. The integration suites
+      # hash at cost 12 (hours under an interpreter) and the SIMD modules use
+      # intrinsics Miri does not implement.
+      - name: cargo miri test
+        run: cargo miri test --release --lib
+
+  asan:
+    name: asan (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Doctests are excluded: rustdoc does not link the sanitizer runtime
+      # (a rustc limitation, not a bug here). Everything else — the full
+      # suite including the live-C differential — runs under ASan.
+      - name: cargo test --release (ASan)
+        run: cargo test --release --lib --tests --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+
+  fuzz:
+    name: fuzz (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --target is explicit on both: cargo-fuzz's defaults are
+          # x86_64-unknown-linux-musl on Linux (static libc — the sanitizer
+          # runtime cannot link into it) and x86_64-apple-darwin on macOS
+          # (not the runner's native target, std not installed).
+          - os: ubuntu-latest
+            target-flag: --target x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target-flag: --target aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    # Two ASan/libFuzzer targets: 2×5 min of runtime plus a cold nightly
+    # sanitizer build.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # cargo-fuzz builds into fuzz/target, not the crate root.
+          workspaces: fuzz -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # decode: the hash-string parser, which eats attacker-controlled input.
+      # tiny_hash: cost validation + the whole hash pipeline at fuzzer-derived
+      # shapes. Both assert only "never panics".
+      - run: cargo fuzz run decode ${{ matrix.target-flag }} -- -max_total_time=300
+      - run: cargo fuzz run tiny_hash ${{ matrix.target-flag }} -- -max_total_time=300
+
+  # Single required check for branch protection: require only `done` instead
+  # of listing every job (and every matrix cell) as a required status check.
+  done:
+    runs-on: ubuntu-latest
+    # Job-level always(): a job whose `needs` include a failed or skipped
+    # dependency is SKIPPED by default, and a step-level always() cannot
+    # resurrect a skipped job. Without this, a failing upstream job would
+    # skip `done` itself — and a skipped aggregate check does not block a
+    # merge. always() forces `done` to run so the step below can fail the run.
+    if: ${{ always() }}
+    needs:
+      - test
+      - windows
+      - no-std
+      - docs
+      - msrv
+      - entropy-target-matrix
+      - old-glibc
+      - wasm
+      - benches-compile
+      - miri
+      - asan
+      - fuzz
+    steps:
+      # `skipped` is included because a failed job (or a failed dependency
+      # upstream of another needed job) leaves the affected `needs` as
+      # `skipped`, not `failure`.
+      - run: exit 1
+        if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')) }}
