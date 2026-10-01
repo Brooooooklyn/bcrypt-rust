@@ -69,8 +69,10 @@ bcrypt-rust = { path = ".", default-features = false, features = ["internal-api"
 
 # Criterion (through rayon) does not build for wasi, and no bench or test
 # target runs there anyway — `cargo test --target wasm32-wasip1` covers the
-# library and the integration tests, never the benches.
+# library and the integration tests, never the benches. The incumbent
+# `bcrypt` crate sits in the same gate: only `benches/vs_bcrypt.rs` uses it.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+bcrypt = "0.19.3"
 codspeed-criterion-compat = "5.0.1"
 criterion = { version = "0.8", features = ["html_reports"] }
 
@@ -79,6 +81,14 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # `benches/bcrypt.rs` say what each group measures and where numbers may go.
 [[bench]]
 name = "bcrypt"
+harness = false
+
+# Head-to-head against the incumbent `bcrypt` crate: same password, same
+# costs, plus the 16-wide batch the incumbent cannot express. Numbers are
+# only meaningful with the machine recorded — `benches/vs_bcrypt.rs` module
+# docs say what each group measures and how the `parallel` leg is run.
+[[bench]]
+name = "vs_bcrypt"
 harness = false
 
 # The CI regression net, measured by CodSpeed's simulation instrument. Small,
