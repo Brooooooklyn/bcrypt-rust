@@ -31,6 +31,10 @@
 //!   must verify; its `$2x$` sibling is the buggy one. Also pinned with
 //!   `must_verify: true`.
 
+// The whole suite exercises the string layer (`HashParts`, `bcrypt_many`,
+// `verify_many`), which is `alloc`-gated — with alloc off this file is empty.
+#![cfg(feature = "alloc")]
+
 use std::collections::BTreeMap;
 
 use bcrypt_rust::{
