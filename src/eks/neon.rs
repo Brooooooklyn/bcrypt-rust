@@ -11,14 +11,25 @@
 //! # State layout: struct-of-arrays
 //!
 //! The four S-boxes are stored interleaved by lane — [`SBoxes4`] — so
-//! entry `(b, i)` holds all four lanes contiguously and one `vst1q_u32`
-//! writes a whole entry during the expansion chains. Lookups are gathers:
-//! lane `l` of a lookup reads `box_base[idx_l * 4 + l]`. NEON has no
-//! gather instruction, so [`lookup4`] does four scalar loads and one
-//! `vld1q_u32`; it is deliberately the only function that touches S-box
-//! memory by computed address, so a later tuning phase can swap the
-//! spelling (e.g. a `vld1q_lane_u32` chain) without touching the kernel
-//! around it.
+//! entry `(b, i)` holds all four lanes contiguously and expansion-chain
+//! writes stay four plain word stores. Lookups are gathers: lane `l` of a
+//! lookup reads `box_base[idx_l * 4 + l]`. NEON has no gather instruction,
+//! so every gather is four scalar loads — see the [`lookup4`] spellings.
+//!
+//! # Tuning summary (M5 Max, `cargo bench --bench micro`, cost 5 batch 64)
+//!
+//! The kernel is ~34k serial Blowfish encryptions per hash; the expansion
+//! S-box loops (512 of 521 encryptions per chain) dominate. Measured
+//! hashes/s, scalar always ~820:
+//!
+//! * 862 — [`lookup4`] spellings (a) stack array and (b) `vld1q_lane`
+//!   chain tie: LLVM lowers (a) to (b)'s loads. Baseline ratio 1.05×.
+//! * 895 — spelling (c), prescaled per-lane byte offsets.
+//! * 1097 — [`f4_split`]: whole F per lane in GPRs (`ldr [base, w, uxtw
+//!   #2]` gathers), macro-inlined + unrolled rounds, u16 extracts.
+//! * 2253 — [`rounds16_scalar!`]: lanes live in eight GPRs through the 16
+//!   rounds; no vector register is touched inside the round loop, so the
+//!   insert→extract round trip leaves the dependency chain. Ratio 2.7–2.9×.
 //!
 //! # Lookup invariant
 //!
@@ -30,8 +41,9 @@
 //! dereference below.
 
 use core::arch::aarch64::{
-    uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, veorq_u32, vgetq_lane_u32, vld1q_u32,
-    vshrq_n_u32, vst1q_u32,
+    uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, veorq_u32, vgetq_lane_u16, vgetq_lane_u32,
+    vld1q_lane_u32, vld1q_u32, vreinterpretq_u16_u32, vsetq_lane_u32, vshlq_n_u32, vshrq_n_u32,
+    vst1q_u32,
 };
 
 use crate::consts::{P_INIT, S_INIT};
@@ -55,19 +67,6 @@ impl SBoxes4 {
         // SAFETY: `b < 4`, so `b * 1024` stays inside the 4096-word array.
         unsafe { self.0.as_ptr().cast::<u32>().add(b * 256 * 4) }
     }
-
-    /// Store one (l, r) pair over entries `e` and `e + 1`.
-    #[target_feature(enable = "neon")]
-    #[inline]
-    fn store_pair(&mut self, e: usize, l: uint32x4_t, r: uint32x4_t) {
-        debug_assert!(e + 1 < 1024);
-        // SAFETY: `e + 1 < 1024`, so both entry pointers land inside the
-        // array; each entry is exactly one 16-byte lane vector.
-        unsafe {
-            vst1q_u32(self.0[e].as_mut_ptr(), l);
-            vst1q_u32(self.0[e + 1].as_mut_ptr(), r);
-        }
-    }
 }
 
 /// The lockstep EksBlowfish state: 18 P-vectors plus the interleaved
@@ -77,12 +76,11 @@ struct State4 {
     s: SBoxes4,
 }
 
+/// Lane byte offsets: lane `l` gathers at `box_base + idx_l * 16 + l * 4`
+/// (the entry stride is 16 bytes — four u32 lanes per entry).
+const LANE_BYTE_OFFSETS: [u32; 4] = [0, 4, 8, 12];
+
 /// Gather one S-box word per lane: lane `l` loads `box_base[idx_l * 4 + l]`.
-///
-/// This is spelling (a) — extract the four indices, four scalar loads,
-/// reassemble with `vld1q_u32`. It is the single, deliberately tiny
-/// function every S-box read goes through, so a later tuning phase can
-/// swap it for a `vld1q_lane_u32` chain without touching any caller.
 ///
 /// # Safety
 ///
@@ -93,6 +91,17 @@ struct State4 {
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn lookup4(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
+    // SAFETY: forwarded unchanged — the spellings share this contract.
+    unsafe { lookup4_scaled(box_base, idx) }
+}
+
+/// [`lookup4`] spelling (a): extract the four indices, four scalar loads
+/// through a stack array, reassemble with `vld1q_u32`. Inactive: LLVM
+/// rewrites the round-trip into `ldr s` + three `ld1` lane inserts anyway.
+#[allow(dead_code)] // kept for re-tuning on other cores; see lookup4
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn lookup4_stack(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
     let i0 = vgetq_lane_u32::<0>(idx) as usize;
     let i1 = vgetq_lane_u32::<1>(idx) as usize;
     let i2 = vgetq_lane_u32::<2>(idx) as usize;
@@ -111,10 +120,62 @@ unsafe fn lookup4(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
     unsafe { vld1q_u32(gathered.as_ptr()) }
 }
 
+/// [`lookup4`] spelling (b): a zeroed vector and four `vld1q_lane_u32`
+/// inserts — one load per lane straight into its slot, no stack array.
+/// Inactive: identical to (a) after LLVM lowering, and both lose to the
+/// prescaled gather (the numbers live at [`lookup4_scaled`]).
+#[allow(dead_code)] // kept for re-tuning on other cores; see lookup4
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn lookup4_lane(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
+    let v = vdupq_n_u32(0);
+    // SAFETY: lookup invariant — every lane of `idx` is `<= 255`, so each
+    // `idx_l * 4 + l < 1024` stays inside the box `box_base` points at.
+    unsafe {
+        let v = vld1q_lane_u32::<0>(box_base.add(vgetq_lane_u32::<0>(idx) as usize * 4), v);
+        let v = vld1q_lane_u32::<1>(box_base.add(vgetq_lane_u32::<1>(idx) as usize * 4 + 1), v);
+        let v = vld1q_lane_u32::<2>(box_base.add(vgetq_lane_u32::<2>(idx) as usize * 4 + 2), v);
+        vld1q_lane_u32::<3>(box_base.add(vgetq_lane_u32::<3>(idx) as usize * 4 + 3), v)
+    }
+}
+
+/// [`lookup4`] spelling (c), active: scale the index vector to *byte*
+/// offsets lane-wise — `idx * 16 + {0,4,8,12}` per lane — so the extracted
+/// GPR value is the finished in-box offset and each gather is one
+/// register-offset `ld1`. Spellings (a)/(b) make the GPR side recompute
+/// that: one `lsl` plus two `add`s per lane (LLVM lowers the stack array
+/// of (a) to (b)'s loads, so they tie). Measured on M5 Max,
+/// `cargo bench --bench micro -- --vs-scalar`, cost 5 batch 64:
+/// (a) 862.5 hashes/s, (b) 862.5, (c) 894.7.
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn lookup4_scaled(box_base: *const u32, idx: uint32x4_t) -> uint32x4_t {
+    // SAFETY: `LANE_BYTE_OFFSETS` is a live 16-byte array, readable in full.
+    let lane_off = unsafe { vld1q_u32(LANE_BYTE_OFFSETS.as_ptr()) };
+    let off = vaddq_u32(vshlq_n_u32::<4>(idx), lane_off);
+    let byte_base = box_base.cast::<u8>();
+    let v = vdupq_n_u32(0);
+    // SAFETY: lookup invariant — `idx_l <= 255`, so the byte offset
+    // `idx_l * 16 + 4 * l <= 0xFFC` stays inside the box's 4 KiB, and the
+    // u32 read at that 4-byte-aligned offset is one box word.
+    unsafe {
+        let v = vld1q_lane_u32::<0>(byte_base.add(vgetq_lane_u32::<0>(off) as usize).cast(), v);
+        let v = vld1q_lane_u32::<1>(byte_base.add(vgetq_lane_u32::<1>(off) as usize).cast(), v);
+        let v = vld1q_lane_u32::<2>(byte_base.add(vgetq_lane_u32::<2>(off) as usize).cast(), v);
+        vld1q_lane_u32::<3>(byte_base.add(vgetq_lane_u32::<3>(off) as usize).cast(), v)
+    }
+}
+
 /// The Blowfish round function, lane-wise: `((S0[a] + S1[b]) ^ S2[c]) + S3[d]`,
 /// bytes taken MSB-first, every addition wrapping (`vaddq_u32` wraps, which
 /// is what the scalar `wrapping_add` does). The byte masks below are what
 /// make the [`lookup4`] gathers safe — see the module-level invariant.
+///
+/// This is the pure-SIMD F: inactive (the P-loops and cdata loop run
+/// [`f4_split`], the S-box loops run [`rounds16_scalar!`] — see the module
+/// "Tuning summary"), kept as the reference datapath the `lookup4`
+/// spellings hang off, and checked against `f4_split` in the tests.
+#[allow(dead_code)] // tested (f4_variants_agree); see the tuning summary
 #[target_feature(enable = "neon")]
 #[inline]
 fn f4(s: &SBoxes4, x: uint32x4_t) -> uint32x4_t {
@@ -138,20 +199,214 @@ fn f4(s: &SBoxes4, x: uint32x4_t) -> uint32x4_t {
     vaddq_u32(veorq_u32(vaddq_u32(va, vb), vc), vd)
 }
 
+/// [`f4`] spelling "split": extract each lane's word to the GPR side once,
+/// split the bytes there, run the four gathers and the `((a + b) ^ c) + d`
+/// combine in scalar code, and insert the results with `vsetq_lane_u32`.
+/// Trades SIMD ops for GPR ALU ops, which issue on different pipes.
+///
+/// The word reaches the GPR side as two `umov.h` 16-bit extracts (lo =
+/// bytes d,c; hi = bytes b,a) rather than one 32-bit `mov.s`: each half
+/// then splits with one `ubfiz`/`ubfx` apiece, moving work off the
+/// saturated GPR-ALU pipes onto the SIMD-move pipes. Measured whole-kernel
+/// with the rounds macro-inlined and unrolled: 1097 hashes/s vs 895 for
+/// the SIMD [`f4`] datapath (M5 Max, cost 5 batch 64).
+#[target_feature(enable = "neon")]
+#[inline]
+fn f4_split(s: &SBoxes4, x: uint32x4_t) -> uint32x4_t {
+    /// Per-lane scalar F from the two half-word extracts.
+    #[inline]
+    fn halves(s: &SBoxes4, lo: u32, hi: u32, lane: usize) -> u32 {
+        let (a, b) = ((hi >> 8) as usize, (hi & 0xff) as usize);
+        let (c, d) = ((lo >> 8) as usize, (lo & 0xff) as usize);
+        // SAFETY: lookup invariant — `a`/`b`/`c`/`d` are bytes by the masks
+        // above, so `idx * 4 + lane < 1024` stays inside each box.
+        unsafe {
+            let va = *s.box_base(0).add(a * 4 + lane);
+            let vb = *s.box_base(1).add(b * 4 + lane);
+            let vc = *s.box_base(2).add(c * 4 + lane);
+            let vd = *s.box_base(3).add(d * 4 + lane);
+            (va.wrapping_add(vb) ^ vc).wrapping_add(vd)
+        }
+    }
+    let x16 = vreinterpretq_u16_u32(x);
+    // Every `halves` call site upholds the module-level lookup invariant
+    // (its byte masks bound each index); the extract/insert intrinsics are
+    // safe aarch64 NEON, so no `unsafe` block is needed here.
+    let v = vsetq_lane_u32::<0>(
+        halves(s, vgetq_lane_u16::<0>(x16).into(), vgetq_lane_u16::<1>(x16).into(), 0),
+        vdupq_n_u32(0),
+    );
+    let v = vsetq_lane_u32::<1>(
+        halves(s, vgetq_lane_u16::<2>(x16).into(), vgetq_lane_u16::<3>(x16).into(), 1),
+        v,
+    );
+    let v = vsetq_lane_u32::<2>(
+        halves(s, vgetq_lane_u16::<4>(x16).into(), vgetq_lane_u16::<5>(x16).into(), 2),
+        v,
+    );
+    vsetq_lane_u32::<3>(
+        halves(s, vgetq_lane_u16::<6>(x16).into(), vgetq_lane_u16::<7>(x16).into(), 3),
+        v,
+    )
+}
+
+/// One lane of the Blowfish round function in scalar code:
+/// `((S0[a] + S1[b]) ^ S2[c]) + S3[d]`, bytes MSB-first, wrapping adds.
+/// Pure GPR code, so it carries no `#[target_feature]` and inlines
+/// anywhere. This is the datapath of [`rounds16_scalar!`].
+#[inline]
+unsafe fn f_word(s: &SBoxes4, w: u32, lane: usize) -> u32 {
+    let a = (w >> 24) as usize;
+    let b = ((w >> 16) & 0xff) as usize;
+    let c = ((w >> 8) & 0xff) as usize;
+    let d = (w & 0xff) as usize;
+    // SAFETY: lookup invariant — `a`/`b`/`c`/`d` are bytes by the masks
+    // above and `lane < 4` at every call site, so `idx * 4 + lane < 1024`
+    // stays inside each box.
+    unsafe {
+        let va = *s.box_base(0).add(a * 4 + lane);
+        let vb = *s.box_base(1).add(b * 4 + lane);
+        let vc = *s.box_base(2).add(c * 4 + lane);
+        let vd = *s.box_base(3).add(d * 4 + lane);
+        (va.wrapping_add(vb) ^ vc).wrapping_add(vd)
+    }
+}
+
+/// The P-array as per-lane scalar words: `pw[i][lane]`. The expansion
+/// S-loops run with a frozen P (the chain's P writes all happen in the
+/// P-loop), so the rounds can read P from this stack copy — four plain
+/// `ldr`s per round instead of one vector load plus four lane extracts.
+#[inline]
+fn p_words(p: &[uint32x4_t; 18]) -> [[u32; 4]; 18] {
+    let mut pw = [[0u32; 4]; 18];
+    for (w, v) in pw.iter_mut().zip(p.iter()) {
+        // SAFETY: `w` is a live 16-byte stack array, writable in full.
+        unsafe { vst1q_u32(w.as_mut_ptr(), *v) };
+    }
+    pw
+}
+
+/// The four lanes of a vector as a plain word array (once per chain —
+/// the scalar rounds keep lanes in GPRs across the whole S-box loop).
+#[inline]
+fn lanes_of(v: uint32x4_t) -> [u32; 4] {
+    let mut w = [0u32; 4];
+    // SAFETY: `w` is a live 16-byte stack array, writable in full.
+    unsafe { vst1q_u32(w.as_mut_ptr(), v) };
+    w
+}
+
+/// The 16 Feistel rounds with all four lanes in GPR word arrays: no vector
+/// register is touched between the extracts before it and the stores after
+/// it, so the round-to-round dependency chain is pure scalar code and the
+/// four lanes' chains overlap in the out-of-order window. Splits the
+/// difference between the two above: vector rounds pay a serial
+/// insert→extract round trip per round; scalar rounds pay four stack
+/// `ldr`s for P per round. Measured whole-kernel: 1097 hashes/s with
+/// vector rounds in the S-box loops, 2253 with scalar rounds (M5 Max,
+/// cost 5 batch 64).
+macro_rules! rounds16_scalar {
+    ($s:expr, $pw:expr,
+     $l0:ident, $l1:ident, $l2:ident, $l3:ident,
+     $r0:ident, $r1:ident, $r2:ident, $r3:ident) => {{
+        // One half-round for one lane: `x ^= P[i]`, `y ^= F(x)`. Eight
+        // separate variables, not two arrays, so the lane state is
+        // guaranteed register-resident (array elements spilled to the
+        // stack under the pressure of the 16 hoisted box bases). The
+        // `black_box` cuts the four lanes' isomorphic instruction trees:
+        // without it LLVM's SLP vectorizer rebuilds a vector from the lane
+        // results and re-extracts it on the next round — an
+        // insert→extract round trip on the per-round dependency chain that
+        // this spelling exists to remove. Measured: 1073 hashes/s without
+        // `black_box` (SLP rebuilt the vectors), 1326 with it but lanes in
+        // arrays (they spilled to the stack), 2253 with it and lanes as
+        // eight named variables. `black_box` compiles to zero
+        // instructions; the value is already in a GPR.
+        macro_rules! half {
+            ($x:ident, $y:ident, $i:expr, $lane:expr) => {{
+                $x ^= $pw[$i][$lane];
+                // SAFETY: `$lane < 4`; the byte masks inside `f_word`
+                // bound every index — the module-level lookup invariant.
+                $y ^= core::hint::black_box(unsafe { f_word($s, $x, $lane) });
+            }};
+        }
+        for pair in 0..8 {
+            half!($l0, $r0, 2 * pair, 0);
+            half!($l1, $r1, 2 * pair, 1);
+            half!($l2, $r2, 2 * pair, 2);
+            half!($l3, $r3, 2 * pair, 3);
+            half!($r0, $l0, 2 * pair + 1, 0);
+            half!($r1, $l1, 2 * pair + 1, 1);
+            half!($r2, $l2, 2 * pair + 1, 2);
+            half!($r3, $l3, 2 * pair + 1, 3);
+        }
+        // Whitening: the pair loop ends in reference post-swap orientation,
+        // so the undo-swap after it exchanges each pair of registers.
+        $l0 ^= $pw[16][0];
+        $l1 ^= $pw[16][1];
+        $l2 ^= $pw[16][2];
+        $l3 ^= $pw[16][3];
+        $r0 ^= $pw[17][0];
+        $r1 ^= $pw[17][1];
+        $r2 ^= $pw[17][2];
+        $r3 ^= $pw[17][3];
+        core::mem::swap(&mut $l0, &mut $r0);
+        core::mem::swap(&mut $l1, &mut $r1);
+        core::mem::swap(&mut $l2, &mut $r2);
+        core::mem::swap(&mut $l3, &mut $r3);
+    }};
+}
+
+/// The 16 Feistel rounds of one lockstep encryption, as a macro so every
+/// caller gets a *textually* inlined copy. `#[inline]` on the equivalent
+/// `#[target_feature]` fn let LLVM keep it out-of-line — one call per
+/// encryption, each re-running the ~30-instruction prologue that computes
+/// the 16 lane-adjusted box bases — and `#[inline(always)]` is rejected on
+/// `#[target_feature]` fns. Inlined per caller, the bases hoist out of the
+/// 521-encryption loops: 1030 hashes/s outlined, 1064 inlined (M5 Max,
+/// cost 5 batch 64, [`f4_split`] datapath).
+///
+/// Written as eight swap-free round pairs: pairing two rounds lets the
+/// roles of `$l` and `$r` alternate between halves, so no `mem::swap` (two
+/// register moves per round in the rolled-loop codegen) ever exists inside
+/// the loop. The whitening lands on the exchanged registers — the pair
+/// loop ends in reference post-swap orientation, so the final swap-undo is
+/// the one `mem::swap` after the loop (register renaming; free).
+macro_rules! rounds16 {
+    ($state:expr, $l:ident, $r:ident) => {{
+        // Fully unrolled: the rolled loop cost a counter compare/branch per
+        // pair and, worse, kept LLVM from scheduling one round's address
+        // math into the previous round's load latency (1064 rolled, 1073
+        // unrolled — small, but free).
+        macro_rules! pair {
+            ($i:expr) => {{
+                $l = veorq_u32($l, $state.p[$i]);
+                $r = veorq_u32($r, f4_split(&$state.s, $l));
+                $r = veorq_u32($r, $state.p[$i + 1]);
+                $l = veorq_u32($l, f4_split(&$state.s, $r));
+            }};
+        }
+        pair!(0);
+        pair!(2);
+        pair!(4);
+        pair!(6);
+        pair!(8);
+        pair!(10);
+        pair!(12);
+        pair!(14);
+        $l = veorq_u32($l, $state.p[16]);
+        $r = veorq_u32($r, $state.p[17]);
+        core::mem::swap(&mut $l, &mut $r);
+    }};
+}
+
 /// One Blowfish block encryption, four lanes in lockstep: 16 Feistel
 /// rounds with the final swap undone, the output halves whitened by
 /// P[16]/P[17] — identical control flow to scalar `encipher`.
 #[target_feature(enable = "neon")]
 #[inline]
 fn encipher4(state: &State4, mut l: uint32x4_t, mut r: uint32x4_t) -> (uint32x4_t, uint32x4_t) {
-    for &p in &state.p[..16] {
-        l = veorq_u32(l, p);
-        r = veorq_u32(r, f4(&state.s, l));
-        core::mem::swap(&mut l, &mut r);
-    }
-    core::mem::swap(&mut l, &mut r);
-    r = veorq_u32(r, state.p[16]);
-    l = veorq_u32(l, state.p[17]);
+    rounds16!(state, l, r);
     (l, r)
 }
 
@@ -180,18 +435,32 @@ fn expand_state_v(state: &mut State4, swv: &[uint32x4_t; 4], kwv: &[uint32x4_t; 
         j += 1;
         r = veorq_u32(r, swv[j % 4]);
         j += 1;
-        (l, r) = encipher4(state, l, r);
+        rounds16!(state, l, r);
         state.p[2 * pair] = l;
         state.p[2 * pair + 1] = r;
     }
+    // Same switch as `encrypt_zero_chain_v`: P is frozen during the S-box
+    // loop, so the salt stream and the lanes all go scalar with it.
+    let pw = p_words(&state.p);
+    let sww: [[u32; 4]; 4] = core::array::from_fn(|i| lanes_of(swv[i]));
+    let [mut l0, mut l1, mut l2, mut l3] = lanes_of(l);
+    let [mut r0, mut r1, mut r2, mut r3] = lanes_of(r);
     for b in 0..4 {
         for pair in 0..128 {
-            l = veorq_u32(l, swv[j % 4]);
+            l0 ^= sww[j % 4][0];
+            l1 ^= sww[j % 4][1];
+            l2 ^= sww[j % 4][2];
+            l3 ^= sww[j % 4][3];
             j += 1;
-            r = veorq_u32(r, swv[j % 4]);
+            r0 ^= sww[j % 4][0];
+            r1 ^= sww[j % 4][1];
+            r2 ^= sww[j % 4][2];
+            r3 ^= sww[j % 4][3];
             j += 1;
-            (l, r) = encipher4(state, l, r);
-            state.s.store_pair(b * 256 + 2 * pair, l, r);
+            rounds16_scalar!(&state.s, &pw, l0, l1, l2, l3, r0, r1, r2, r3);
+            let e = b * 256 + 2 * pair;
+            state.s.0[e] = [l0, l1, l2, l3];
+            state.s.0[e + 1] = [r0, r1, r2, r3];
         }
     }
 }
@@ -204,14 +473,21 @@ fn expand_state_v(state: &mut State4, swv: &[uint32x4_t; 4], kwv: &[uint32x4_t; 
 fn encrypt_zero_chain_v(state: &mut State4) {
     let (mut l, mut r) = (vdupq_n_u32(0), vdupq_n_u32(0));
     for pair in 0..9 {
-        (l, r) = encipher4(state, l, r);
+        rounds16!(state, l, r);
         state.p[2 * pair] = l;
         state.p[2 * pair + 1] = r;
     }
+    // P is frozen from here on: hoist it to scalar words and run the S-box
+    // loop with all four lanes in GPRs — see `rounds16_scalar`.
+    let pw = p_words(&state.p);
+    let [mut l0, mut l1, mut l2, mut l3] = lanes_of(l);
+    let [mut r0, mut r1, mut r2, mut r3] = lanes_of(r);
     for b in 0..4 {
         for pair in 0..128 {
-            (l, r) = encipher4(state, l, r);
-            state.s.store_pair(b * 256 + 2 * pair, l, r);
+            rounds16_scalar!(&state.s, &pw, l0, l1, l2, l3, r0, r1, r2, r3);
+            let e = b * 256 + 2 * pair;
+            state.s.0[e] = [l0, l1, l2, l3];
+            state.s.0[e + 1] = [r0, r1, r2, r3];
         }
     }
 }
@@ -410,6 +686,77 @@ mod tests {
         let copied = password.len().min(72);
         key[..copied].copy_from_slice(&password[..copied]);
         expand_key_words(&key, (copied + 1).min(72))
+    }
+
+    /// The inactive lookup spellings must agree with the active
+    /// [`lookup4_scaled`] on every index vector — they stay in the tree as
+    /// tuning alternatives, so they stay checked.
+    #[test]
+    fn lookup_spellings_agree() {
+        let mut boxes = SBoxes4([[0; 4]; 1024]);
+        for (entry, words) in boxes.0.iter_mut().enumerate() {
+            *words = [
+                entry as u32,
+                (entry as u32) ^ 0xAAAA_AAAA,
+                (entry as u32).wrapping_mul(31),
+                !(entry as u32),
+            ];
+        }
+        for i in 0..256u32 {
+            // SAFETY: the 4-word stack array is a live 16-byte read source.
+            let idx = unsafe { vld1q_u32([i, 255 - i, i ^ 0x5A, (i * 7) & 0xFF].as_ptr()) };
+            // SAFETY: `idx` lanes are all in `0..=255` by construction, and
+            // each `box_base` points at a real 256-entry box of `boxes` —
+            // the module-level lookup invariant.
+            let (a, b, c) = unsafe {
+                (
+                    lookup4_stack(boxes.box_base((i % 4) as usize), idx),
+                    lookup4_lane(boxes.box_base((i % 4) as usize), idx),
+                    lookup4_scaled(boxes.box_base((i % 4) as usize), idx),
+                )
+            };
+            let (mut wa, mut wb, mut wc) = ([0u32; 4], [0u32; 4], [0u32; 4]);
+            // SAFETY: all three are live 16-byte stack arrays, writable in full.
+            unsafe {
+                vst1q_u32(wa.as_mut_ptr(), a);
+                vst1q_u32(wb.as_mut_ptr(), b);
+                vst1q_u32(wc.as_mut_ptr(), c);
+            }
+            assert_eq!(wa, wb, "spellings (a)/(b) diverged at index set {i}");
+            assert_eq!(wa, wc, "spellings (a)/(c) diverged at index set {i}");
+        }
+    }
+
+    /// The inactive SIMD [`f4`] must agree with the active [`f4_split`] —
+    /// it is the reference datapath the `lookup4` spellings hang off, so
+    /// it stays checked against the code that actually ships in the loops.
+    #[test]
+    fn f4_variants_agree() {
+        let mut boxes = SBoxes4([[0; 4]; 1024]);
+        let mut state = 0x853C_49E6_748F_EA9Bu64; // splitmix64 constant
+        for entry in boxes.0.iter_mut().flatten() {
+            // Deterministic pseudo-random fill (SplitMix64 steps).
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            *entry = (z ^ (z >> 31)) as u32;
+        }
+        for i in 0..64u32 {
+            let x = [i, !i, i.wrapping_mul(0x0101_0101), i.rotate_right(8) | 0x5A5A];
+            // SAFETY: `xv` is a live 16-byte stack array, readable in full.
+            let xv = unsafe { vld1q_u32(x.as_ptr()) };
+            // SAFETY: this module only compiles on aarch64, where NEON is
+            // baseline — the same scope argument as `lanes_match_scalar`.
+            let (a, b) = unsafe { (f4(&boxes, xv), f4_split(&boxes, xv)) };
+            let (mut wa, mut wb) = ([0u32; 4], [0u32; 4]);
+            // SAFETY: both are live 16-byte stack arrays, writable in full.
+            unsafe {
+                vst1q_u32(wa.as_mut_ptr(), a);
+                vst1q_u32(wb.as_mut_ptr(), b);
+            }
+            assert_eq!(wa, wb, "f4 variants diverged at input {i}");
+        }
     }
 
     /// Four different passwords and four different salts, one per lane,
