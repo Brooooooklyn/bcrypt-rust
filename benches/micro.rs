@@ -170,6 +170,13 @@ fn calibrate(
 fn main() {
     let args = parse_args();
 
+    // Surface the runtime detection pick before any arm runs: on a host with
+    // both x86-64 SIMD backends this is the width shootout's winner (and pays
+    // its one-time cost up front, outside every timed loop). The arms below
+    // still drive each backend explicitly, so both sides can be compared
+    // against the pick in one window.
+    println!("detected backend: {}", bcrypt_rust::detected_backend());
+
     // Fixed seed, chosen arbitrarily: "bcrypt bench 1". Reproducible.
     let mut rng = SplitMix64::new(0xBC79_7BE0_0000_0001);
     let store: Vec<Vec<u8>> = (0..args.batch)

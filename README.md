@@ -50,9 +50,10 @@ batch 16:
 | AVX-512 | 16 | 798.5 | 1.42× |
 
 AVX-512 loses to AVX2 on Zen 4: its SoA S-boxes are 64 KiB (vs AVX2's 32 KiB,
-exactly L1d-sized) and Zen 4 double-pumps 512-bit ops anyway. Runtime
-dispatch still prefers AVX-512 when present — on Intel hardware with real
-512-bit units the wider kernel should pull ahead; see "Dispatch notes" below.
+exactly L1d-sized) and Zen 4 double-pumps 512-bit ops anyway. On Intel cores
+with native 512-bit units (Sapphire Rapids) the wide kernel pulls ahead
+instead, so runtime dispatch picks between the two by measurement — a
+one-time width shootout; see "Dispatch notes" below.
 
 Single-hash latency, cost 4: **646 µs** (criterion, M5 Max). Throughput
 scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
@@ -110,10 +111,14 @@ a batch of 16 on 4 cores stays single-worker by design.
 
 ### Dispatch notes
 
-On Zen 4, AVX2 beats AVX-512 by ~8% (working-set and double-pump reasons
-above), but `detect()` prefers AVX-512 wherever `avx512f` exists — the wider
-kernel is the right default for Intel cores with native 512-bit units. If a
-Zen 4 deployment wants the last 8%, force the backend through
+Which of AVX2 and AVX-512 wins is a µarch question (working-set and
+double-pump reasons above on Zen; the fast zmm hardware gather on Sapphire
+Rapids), so `detect()` answers it by measurement: on `std` release builds, a
+host advertising both runs a one-time width shootout — a cost-4, 32-item
+batch through both backends' kernels, outputs asserted byte-identical before
+anything is timed, three interleaved reps each, min wins — and caches the
+winner for the process. Debug, `no_std` and Miri builds keep the static
+AVX-512-first order. To override the pick, force the backend through
 `__internal::bcrypt_many_with_backend` (`internal-api` feature) or run the
 two explicitly and pick per machine, as `benches/micro.rs` does.
 

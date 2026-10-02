@@ -27,13 +27,41 @@
 //! * Detection runs at most once per process. The result is cached in a
 //!   [`AtomicU8`] read with [`Ordering::Relaxed`]. The initialisation race is
 //!   benign: every thread computes the same answer, so a duplicated `detect()`
-//!   only wastes a `cpuid`.
+//!   only wastes a `cpuid`. (The one exception: the width shootout below can
+//!   make a racing duplicate *measure* twice; the cache is single-assignment,
+//!   so all threads still settle on one pick.)
 //! * A batch call resolves the function pointer **once**, before chunking into
 //!   lane-width groups (see `crate::core`). Nothing dispatches inside the
 //!   per-group loop.
 //! * Per batch: one relaxed load plus one compare. Per group: one indirect
 //!   call. A group is `lanes` full bcrypt hashes — expensive at any realistic
 //!   cost — so dispatch overhead is nil.
+//!
+//! # The x86-64 width shootout (AVX2 vs AVX-512)
+//!
+//! Wider is not automatically faster for bcrypt. Every lane carries a 4 KiB
+//! mutable S-box working set, so the 16-lane AVX-512 kernel's struct-of-
+//! arrays touches 64 KiB per group — twice the 32 KiB L1d of Zen 3/4, whose
+//! 512-bit ops are also double-pumped — while Sapphire Rapids has a 6.0c zmm
+//! hardware gather and 48 KiB L1d, where the wide kernel pulls clearly ahead
+//! (`docs/research/research-x86-microarch.md`, §4–7). The measured spread on
+//! this crate confirms both sides: Zen 4 is at parity (avx2 888.6 vs avx512
+//! 889.2 hashes/s, cost 5 batch 16, rustc 1.99) while SPR-class cores favor
+//! AVX-512 decisively. No vendor table captures that split — Zen 5, mobile
+//! Zen 5 and Turin Dense all differ again — so [`detect`] settles it by
+//! *measurement*: with `std`, optimized code and no Miri, a CPU advertising
+//! both AVX2 and AVX-512F runs a one-time width shootout — the same fixed
+//! 32-password batch at cost 4 through both backends' normal kernels (which
+//! also settles each backend's own flavor shootout), outputs asserted
+//! byte-identical before anything is timed (a mismatch is a kernel bug, not
+//! a tie), three interleaved timed reps each, min wins. The winner is cached
+//! in `CACHED_WIDTH`; a tie keeps the static order. The one-time cost is
+//! measured, not theoretical: ~0.4 s on the shared 4-vCPU Zen 4 sandbox
+//! (a cost-4 hash there is ~0.55 ms, and the batch is hashed eight times per
+//! side — once for the assert, three times for the clock — plus each
+//! backend's own flavor shootout; the winner's would be paid by the first
+//! batch call anyway). Debug, `no_std` and Miri builds never time anything —
+//! they keep the static `Avx512`-first order.
 //!
 //! # `no_std`
 //!
@@ -310,8 +338,13 @@ static CACHED_BACKEND: AtomicU8 = AtomicU8::new(UNINIT);
 /// Preference order: `Avx512 > Avx2 > Sse41` on x86(-64), `Neon` on AArch64,
 /// `Wasm128` on simd128-enabled wasm32, `Scalar` everywhere else. The probes
 /// are arch-gated, so the single cascade below cannot pick an off-arch backend.
+/// The one exception to the static order is the module-level width shootout:
+/// where it applies it can demote `Avx512` to `Avx2` — by measurement.
 ///
-/// This always re-runs detection; use [`backend`] for the cached value.
+/// The cascade itself always re-runs (a few `cpuid` reads, each cached by the
+/// standard library); the one expensive decision — the width shootout, when
+/// it applies — is cached after the first call, so a repeated `detect()`
+/// stays cheap. Use [`backend`] for the fully cached value.
 #[must_use]
 pub fn detect() -> Backend {
     if cfg!(miri) {
@@ -322,7 +355,9 @@ pub fn detect() -> Backend {
         // job arch-independent.
         Backend::Scalar
     } else if have_avx512f() {
-        Backend::Avx512
+        // Both x86-64 SIMD widths exist; which is faster is a µarch
+        // question the width shootout answers where it can (module docs).
+        width_pick()
     } else if have_avx2() {
         Backend::Avx2
     } else if have_sse41() {
@@ -359,6 +394,147 @@ pub fn backend() -> Backend {
         detect_and_cache()
     } else {
         Backend::from_u8(cached)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Width shootout: AVX2 vs AVX-512 (x86-64, std, optimized, non-Miri only)
+// ---------------------------------------------------------------------------
+
+/// Cached width-shootout winner as a `u8`, or [`UNINIT`] — the same sentinel
+/// protocol as [`CACHED_BACKEND`]. Only ever holds [`Backend::Avx2`] or
+/// [`Backend::Avx512`]; single-assignment (see [`width_shootout_and_cache`]).
+#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+static CACHED_WIDTH: AtomicU8 = AtomicU8::new(UNINIT);
+
+/// The answer to "AVX-512F advertised": which width actually wins on *this*
+/// CPU. With a clock and optimized code a one-time shootout decides (module
+/// docs); it needs AVX2 as the alternative, and without it the static order
+/// stands. Reached only from [`detect`]'s `have_avx512f()` arm, so AVX-512F
+/// is known available here.
+#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+fn width_pick() -> Backend {
+    if !have_avx2() {
+        return Backend::Avx512;
+    }
+    let cached = CACHED_WIDTH.load(Ordering::Relaxed);
+    if cached != UNINIT {
+        return Backend::from_u8(cached);
+    }
+    width_shootout_and_cache()
+}
+
+/// See the measuring variant above. Debug builds, `no_std` and Miri keep the
+/// static AVX-512-first order: timing unoptimized/interpreted intrinsics
+/// measures the codegen mode, not the µarch — and without `std` there is no
+/// clock at all (the flavor shootouts make the same trade).
+#[cfg(not(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri))))]
+fn width_pick() -> Backend {
+    Backend::Avx512
+}
+
+/// Run the shootout and publish the winner. `compare_exchange` makes the
+/// cache single-assignment: a racing duplicate measures the same class of
+/// answer, but on parity machines two measurements can flip, and every
+/// thread must agree with the value [`detect_and_cache`] may already have
+/// published. First store wins; losers take the established pick.
+#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+#[cold]
+#[inline(never)]
+fn width_shootout_and_cache() -> Backend {
+    let picked = width_shootout();
+    match CACHED_WIDTH.compare_exchange(UNINIT, picked.to_u8(), Ordering::Relaxed, Ordering::Relaxed)
+    {
+        Ok(_) => picked,
+        Err(established) => Backend::from_u8(established),
+    }
+}
+
+/// The one-time width shootout: both x86-64 SIMD backends hash the same fixed
+/// deterministic 32-password batch at cost 4 — correctness first
+/// (byte-identical outputs; a mismatch is a kernel bug, not a tie), then
+/// three interleaved timed reps each, min per side, faster wins. A tie keeps
+/// the static order (AVX-512). The batch is 32 items — four AVX2 groups /
+/// two AVX-512 groups, a multiple of both lane counts, so no padded tail
+/// distorts either side and both backends hash the same 32 passwords, making
+/// raw elapsed time a per-hash comparison.
+#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+fn width_shootout() -> Backend {
+    use std::time::Instant;
+
+    // SplitMix64, fixed seed: deterministic inputs (not a CSPRNG, nor does
+    // it need to be).
+    let mut rng = 0xBC79_7A5A_F1A0_0003u64;
+    let mut next_u32 = move || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) as u32
+    };
+    const ITEMS: usize = 32;
+    let mut kws = [[0u32; 18]; ITEMS];
+    let mut sws = [[0u32; 4]; ITEMS];
+    for w in kws.as_flattened_mut().iter_mut().chain(sws.as_flattened_mut()) {
+        *w = next_u32();
+    }
+
+    // One backend's kernel over the whole batch, in lane-width groups — the
+    // same dispatch `crate::core`'s chunk loop performs.
+    fn run_batch(
+        kernel: BcryptLanesFn,
+        lanes: usize,
+        kws: &[[u32; 18]; ITEMS],
+        sws: &[[u32; 4]; ITEMS],
+        outs: &mut [[u8; 24]; ITEMS],
+    ) {
+        let mut base = 0;
+        while base < ITEMS {
+            // SAFETY: `width_shootout` runs only when both AVX2 and AVX-512F
+            // are advertised (`width_pick`'s gate), so both kernels target
+            // this CPU's instruction set. `ITEMS` is a multiple of both lane
+            // counts, so every group slice is exactly `lanes` long, and each
+            // `outs` group is exclusively owned by this frame.
+            unsafe {
+                kernel(
+                    4,
+                    &kws[base..base + lanes],
+                    &sws[base..base + lanes],
+                    &mut outs[base..base + lanes],
+                )
+            };
+            base += lanes;
+        }
+    }
+
+    let avx2 = bcrypt_lanes_fn(Backend::Avx2);
+    let avx512 = bcrypt_lanes_fn(Backend::Avx512);
+    let mut outs_avx2 = [[0u8; 24]; ITEMS];
+    let mut outs_avx512 = [[0u8; 24]; ITEMS];
+    // Correctness before timing: these first calls also run each backend's
+    // own flavor shootout, so both kernels are fully warmed before the clock
+    // starts.
+    run_batch(avx2, Backend::Avx2.lanes(), &kws, &sws, &mut outs_avx2);
+    run_batch(avx512, Backend::Avx512.lanes(), &kws, &sws, &mut outs_avx512);
+    assert_eq!(
+        outs_avx2, outs_avx512,
+        "width shootout: avx2 and avx512 kernels diverged — a kernel bug, not timing"
+    );
+    let (mut best_avx2, mut best_avx512) = (f64::MAX, f64::MAX);
+    for _ in 0..3 {
+        let start = Instant::now();
+        run_batch(avx2, Backend::Avx2.lanes(), &kws, &sws, &mut outs_avx2);
+        best_avx2 = best_avx2.min(start.elapsed().as_secs_f64());
+        let start = Instant::now();
+        run_batch(avx512, Backend::Avx512.lanes(), &kws, &sws, &mut outs_avx512);
+        best_avx512 = best_avx512.min(start.elapsed().as_secs_f64());
+        core::hint::black_box(&mut outs_avx2);
+        core::hint::black_box(&mut outs_avx512);
+    }
+    if best_avx2 < best_avx512 {
+        Backend::Avx2
+    } else {
+        Backend::Avx512
     }
 }
 
@@ -458,6 +634,24 @@ mod tests {
         // Second call takes the cached path.
         assert_eq!(backend(), first);
         assert_ne!(CACHED_BACKEND.load(Ordering::Relaxed), UNINIT);
+    }
+
+    /// Where both x86-64 SIMD backends exist, detection's pick is one of the
+    /// two and stable across calls — the width shootout's winner is cached.
+    /// Hosts without both widths (including Miri, which pins Scalar, and
+    /// Rosetta, which lacks AVX-512) have no pick to make: skip.
+    #[test]
+    fn width_pick_is_stable_and_cached() {
+        if cfg!(miri) || !(Backend::Avx2.is_available() && Backend::Avx512.is_available()) {
+            return;
+        }
+        let first = detect();
+        assert!(matches!(first, Backend::Avx2 | Backend::Avx512));
+        // Second call reads the cached pick: same answer, and where the
+        // shootout is compiled in at all its cache is populated.
+        assert_eq!(detect(), first);
+        #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+        assert_ne!(CACHED_WIDTH.load(Ordering::Relaxed), UNINIT);
     }
 
     #[test]
