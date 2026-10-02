@@ -1,12 +1,29 @@
-//! wasm32 SIMD128 EksBlowfish: four independent bcrypt hashes in lockstep,
-//! one per 32-bit `v128` lane.
+//! wasm32 SIMD128 EksBlowfish: eight independent bcrypt hashes per kernel
+//! call, run as two interleaved four-lane `v128` states — "X2": lanes
+//! 0..=3 form state A, lanes 4..=7 state B.
 //!
 //! Ports [`super::scalar`] exactly — same OpenBSD structure, same
 //! continuous salt-word stream across the P→S transition in
 //! `expand_state`, same key-then-salt cost-loop order — with every 32-bit
-//! operation widened to a lane-wise `v128` one. Scalar `wrapping_add`
-//! becomes `i32x4_add` (wraps, which is what Blowfish wants); every XOR
-//! becomes `v128_xor`.
+//! operation widened to a lane-wise `v128` one, two states in flight at
+//! once. Scalar `wrapping_add` becomes `i32x4_add` (wraps, which is what
+//! Blowfish wants); every XOR becomes `v128_xor`.
+//!
+//! # Why X2: the single-state 4-lane shape is at its ceiling
+//!
+//! The 4-lane lockstep kernel measured 1.21× over scalar-in-wasm
+//! (wasmtime 48, M5 Max, cost 4) — already ~90–95% of the ceiling for
+//! that shape: natively, a 4-lane AVX2 bcrypt *with a real hardware
+//! gather* reaches only 1.33× (pbcrypt). The one shape with native
+//! evidence past that ceiling is interleaving independent dependency
+//! chains — John the Ripper's X2/X3 instruction-interleaved scalar beat
+//! its own AVX2-gather kernel — so the round loop below interleaves A and
+//! B at the F() level: B's gathers issue while A's store-forward
+//! crossings resolve, and vice versa. Measured (wasmtime 48, M5 Max,
+//! cost 4): 1.21× → ~1.58× over scalar-in-wasm — but only with the
+//! lookup rebuild spelled as independent stores (see "No gather" below);
+//! with LLVM's lane-load fusion the same X2 kernel merely ties the
+//! 4-lane one.
 //!
 //! # Selection is compile-time, and why that is sound here
 //!
@@ -20,147 +37,246 @@
 //! compile time, and [`super::have_wasm_simd128`] answers from that same
 //! cfg — the crate can never dispatch to an instruction the engine lacks.
 //!
-//! # State layout: struct-of-arrays
+//! # State layout: struct-of-arrays, eight lanes wide
 //!
-//! The four S-boxes are stored interleaved by lane — [`SBoxes4x`] — so
-//! entry `(b, i)` holds all four lanes contiguously and expansion-chain
-//! writes stay full-vector stores. Lookups are gathers: lane `l` of a
-//! lookup reads `box_base[idx_l * 4 + l]`.
+//! The four S-boxes are stored interleaved by lane — [`SBoxes8x`] — so
+//! entry `(b, i)` holds all eight lanes contiguously (A in the low 16
+//! bytes, B in the high) and expansion-chain writes stay full-vector
+//! stores. Lookups are gathers: lane `l` of a lookup reads
+//! `box_base[idx_l * 8 + l]`. The entry stride is a power of two
+//! (32 bytes), so `idx * 8 + l` is one shift and an add. 32 KiB of S-box
+//! per kernel: M-series' 128 KiB L1d holds it easily; 32–48 KiB x86 L1d
+//! is why the width caps at X2 rather than going wider.
 //!
-//! # No gather at this ISA — one lookup spelling
+//! # No gather at this ISA — and LLVM's lane fusion must be declined
 //!
-//! wasm SIMD128 has no gather instruction, so every lookup is four scalar
-//! loads; the only question is how the indices cross between the vector
-//! and scalar domains. wasm has no extract-to-memory penalty to weigh
-//! against insert chains, so there is one spelling, the same "stack
-//! round-trip" `super::sse41` ships: store the index vector, four scalar
-//! loads, load the results back. The four loads are independent and the
-//! engine's store-to-load forwarding handles the crossings.
+//! wasm SIMD128 has no gather instruction, so every lookup is eight
+//! scalar loads; the only question is how values cross between the
+//! vector and scalar domains. Given the plain "stack round-trip"
+//! spelling (store the index vectors, scalar loads, load the results
+//! back), LLVM's wasm backend rewrites both crossings: indices become
+//! `i32x4.extract_lane` (fine — independent `umov`s) but the S-box loads
+//! get fused into `v128.load32_lane` chains, where each lane-inserting
+//! load depends on the previous one through the destination register —
+//! serializing the one part of the kernel that must stay parallel.
+//! [`lookup8`] therefore pins the rebuild with volatile writes to its
+//! own stack array: wasm has no volatile memory ops, so engines receive
+//! plain stores and loads — the qualifier only opts this one spot out of
+//! LLVM's fusion. Measured (wasmtime 48, M5 Max, cost 4, batch 8, ratio
+//! vs scalar-in-wasm):
+//!
+//! | kernel      | LLVM-fused rebuild | pinned rebuild |
+//! |-------------|--------------------|----------------|
+//! | 4-lane      | 1.21× (~1550 h/s)  | 1.00× (~1225)  |
+//! | 8-lane (X2) | 1.22× (~1575)      | ~1.58× (~1920–2025) |
+//!
+//! The pinned spelling only wins with a second dependency chain to hide
+//! its store-forward latency — which is exactly what X2 provides.
 //!
 //! # Lookup invariant
 //!
-//! Every index vector handed to [`lookup4`] is a byte-masked value (a
-//! `>> 24` or `& 0xff` of a `u32` lane) produced inside [`f4`], so every
-//! lane is in `0..=255` and `idx * 4 + lane` stays inside the addressed
-//! 256-entry box — a gather can never leave the 16 KiB [`SBoxes4x`]. The
-//! invariant is stated once here and referenced at every unsafe
-//! dereference below.
+//! Every index handed to [`lookup8`] is a *pre-scaled* byte value —
+//! `idx * 8 + lane` per lane, where `idx` is a `>> 24` or `& 0xff` of a
+//! `u32` lane produced inside [`f8`] — so every lane is in `0..=2047`
+//! and stays inside the addressed 256-entry box: a gather can never
+//! leave the 32 KiB [`SBoxes8x`]. The invariant is stated once here and
+//! referenced at every unsafe dereference below.
 //!
 //! # Zeroization
 //!
 //! With the `zeroize` feature the kernel wipes its named key-material
-//! buffers — the `State4x` expansion state, the `kwv` transposed key
-//! schedule and `cdata` — before returning, best-effort like the rest of
-//! the crate: compiler spills and transposition-internal temporaries are
-//! not chased.
+//! buffers — the [`State8x`] expansion state (both P-arrays and the
+//! S-boxes), the `kwa`/`kwb` transposed key schedules and `ca`/`cb` —
+//! before returning, best-effort like the rest of the crate: compiler
+//! spills and transposition-internal temporaries are not chased.
 
 use core::arch::wasm32::{
-    i32x4_add, u32x4_shr, u32x4_splat, v128, v128_and, v128_load, v128_store, v128_xor,
+    i32x4_add, i32x4_shl, u32x4_shr, u32x4_splat, v128, v128_and, v128_load, v128_store, v128_xor,
 };
 
 use crate::consts::{P_INIT, S_INIT};
 
-/// Passwords per kernel call — the four 32-bit `v128` lanes.
-const LANES: usize = 4;
+/// Per-lane gather offsets inside one [`SBoxes8x`] entry: state A occupies
+/// the low half of each 8-word entry, state B the high half.
+static LANE_OFFSETS_A: [u32; 4] = [0, 1, 2, 3];
+static LANE_OFFSETS_B: [u32; 4] = [4, 5, 6, 7];
 
-/// Four lockstep S-boxes, interleaved by lane: entry `b * 256 + i` is the
-/// `(b, i)` Blowfish S-box word of all four lanes, lane `l` at u32 offset
-/// `(b * 256 + i) * 4 + l`. 16 KiB, 64-byte aligned, so every entry is
-/// 16-byte aligned by construction (the entry stride divides the struct
-/// alignment).
+/// Passwords per kernel call: two interleaved 4-lane `v128` states —
+/// lanes 0..=3 are state A, lanes 4..=7 state B.
+pub(crate) const LANES: usize = 8;
+
+/// Eight lockstep S-boxes, interleaved by lane: entry `b * 256 + i` is
+/// the `(b, i)` Blowfish S-box word of all eight lanes, lane `l` at u32
+/// offset `(b * 256 + i) * 8 + l` — the A state in the low 16 bytes, B in
+/// the high. 32 KiB, 64-byte aligned, so each 32-byte entry and each
+/// 16-byte half of it are aligned by construction (the entry stride
+/// divides the struct alignment).
 #[repr(C, align(64))]
-struct SBoxes4x([[u32; 4]; 1024]);
+struct SBoxes8x([[u32; 8]; 1024]);
 
-impl SBoxes4x {
+impl SBoxes8x {
     /// Base pointer of box `b` — the address lane gathers index from.
     #[inline(always)]
     fn box_base(&self, b: usize) -> *const u32 {
         debug_assert!(b < 4);
-        // SAFETY: `b < 4`, so `b * 1024` stays inside the 4096-word array.
-        unsafe { self.0.as_ptr().cast::<u32>().add(b * 256 * 4) }
+        // SAFETY: `b < 4`, so `b * 2048` stays inside the 8192-word array.
+        unsafe { self.0.as_ptr().cast::<u32>().add(b * 256 * 8) }
     }
 }
 
-/// The lockstep EksBlowfish state: 18 P-vectors plus the interleaved
-/// S-boxes — the lane-wise image of scalar `State`.
-struct State4x {
-    p: [v128; 18],
-    s: SBoxes4x,
+/// The X2 lockstep EksBlowfish state: two lane-wise images of scalar
+/// `State`'s P-array (A for lanes 0..=3, B for lanes 4..=7) plus the
+/// interleaved S-boxes both halves share.
+struct State8x {
+    pa: [v128; 18],
+    pb: [v128; 18],
+    s: SBoxes8x,
 }
 
-/// Gather one S-box word per lane: lane `l` loads `box_base[idx_l * 4 + l]`.
-/// Stack round-trip spelling (the only one — see the module docs): store
-/// the index vector, four scalar loads, load the results back.
+/// Gather one S-box word per lane of both half-states at once, from
+/// *pre-scaled* index vectors: lane `l` of `sa`/`sb` must already hold
+/// `idx * 8 + l` / `idx * 8 + 4 + l`, so each lane's address is one
+/// scalar add of `box_base` (scaling in the vector domain costs two
+/// vector ops per byte position instead of a shift and two adds per
+/// extracted lane). Stack round-trip spelling (the only one — see the
+/// module docs): store both index vectors side by side, eight scalar
+/// loads with A's and B's alternating so B's independent chain issues
+/// while A's store-forward resolves, load both result vectors back.
 ///
 /// # Safety
 ///
 /// `box_base` must point at the first word of one 256-entry box of an
-/// [`SBoxes4x`], and every lane of `idx` must be in `0..=255` — the
-/// module-level lookup invariant. Then `idx_l * 4 + l < 1024` and each
-/// load stays inside that box's 4 KiB.
+/// [`SBoxes8x`], and lane `l` of `sa`/`sb` must be `idx * 8 + l` /
+/// `idx * 8 + 4 + l` with `idx <= 255` — the module-level lookup
+/// invariant, pre-scaled. Then every lane is `<= 2047` and each load
+/// stays inside that box's 8 KiB.
 #[target_feature(enable = "simd128")]
 #[inline]
-unsafe fn lookup4(box_base: *const u32, idx: v128) -> v128 {
-    let mut ix = [0u32; 4];
-    // SAFETY: `ix` is a live 16-byte stack array, writable in full.
-    unsafe { v128_store(ix.as_mut_ptr().cast::<v128>(), idx) };
-    let gathered = [
-        // SAFETY: lookup invariant — `ix[l] <= 255`, so `ix[l] * 4 + l`
-        // stays inside the box `box_base` points at (repeated per load).
-        unsafe { *box_base.add(ix[0] as usize * 4) },
-        // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[1] as usize * 4 + 1) },
-        // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[2] as usize * 4 + 2) },
-        // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[3] as usize * 4 + 3) },
-    ];
-    // SAFETY: `gathered` is a live 16-byte stack array, readable in full.
-    unsafe { v128_load(gathered.as_ptr().cast::<v128>()) }
+unsafe fn lookup8(box_base: *const u32, sa: v128, sb: v128) -> (v128, v128) {
+    let mut ix = [0u32; 8];
+    // SAFETY: `ix` is a live 32-byte stack array; the two stores cover
+    // its bytes 0..16 and 16..32 in full.
+    unsafe {
+        v128_store(ix.as_mut_ptr().cast::<v128>(), sa);
+        v128_store(ix.as_mut_ptr().add(4).cast::<v128>(), sb);
+    }
+    // SAFETY: lookup invariant — `ix[l] <= 2047`, so each load stays
+    // inside the 2048-word box `box_base` points at.
+    let a0 = unsafe { *box_base.add(ix[0] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let b0 = unsafe { *box_base.add(ix[4] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let a1 = unsafe { *box_base.add(ix[1] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let b1 = unsafe { *box_base.add(ix[5] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let a2 = unsafe { *box_base.add(ix[2] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let b2 = unsafe { *box_base.add(ix[6] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let a3 = unsafe { *box_base.add(ix[3] as usize) };
+    // SAFETY: lookup invariant — see a0.
+    let b3 = unsafe { *box_base.add(ix[7] as usize) };
+    // The volatile writes pin the rebuild to the stack spelling: wasm
+    // has no volatile memory ops, so engines see plain stores and loads
+    // — the qualifier only stops LLVM's wasm backend from fusing the
+    // eight S-box loads into `v128.load32_lane` chains. Those chains are
+    // serial (each lane-inserting load reads and writes the destination
+    // register), and with them this kernel measured ~1575 h/s where the
+    // independent-store spelling measures ~1920-2025 (wasmtime 48,
+    // M5 Max, cost 4, batch 8).
+    //
+    // SAFETY: `gathered` is a live 32-byte stack array, exclusively
+    // owned, written in full before the two reads below.
+    let mut gathered = [0u32; 8];
+    // SAFETY: as above — `gathered` is exclusively-owned stack memory,
+    // valid for writes of all eight words and then full reads.
+    unsafe {
+        core::ptr::write_volatile(&mut gathered[0], a0);
+        core::ptr::write_volatile(&mut gathered[1], a1);
+        core::ptr::write_volatile(&mut gathered[2], a2);
+        core::ptr::write_volatile(&mut gathered[3], a3);
+        core::ptr::write_volatile(&mut gathered[4], b0);
+        core::ptr::write_volatile(&mut gathered[5], b1);
+        core::ptr::write_volatile(&mut gathered[6], b2);
+        core::ptr::write_volatile(&mut gathered[7], b3);
+        (
+            core::ptr::read_volatile(gathered.as_ptr().cast::<v128>()),
+            core::ptr::read_volatile(gathered.as_ptr().add(4).cast::<v128>()),
+        )
+    }
 }
 
-/// The Blowfish round function, lane-wise: `((S0[a] + S1[b]) ^ S2[c]) + S3[d]`,
-/// bytes taken MSB-first, every addition wrapping (`i32x4_add` wraps,
-/// which is what the scalar `wrapping_add` does). The byte masks below are
-/// what make the [`lookup4`] gathers safe — see the module-level invariant.
+/// The Blowfish round function on both half-states at once:
+/// `((S0[a] + S1[b]) ^ S2[c]) + S3[d]` per state, bytes taken MSB-first,
+/// every addition wrapping (`i32x4_add` wraps, which is what the scalar
+/// `wrapping_add` does). Running A and B through one body is the X2
+/// latency hiding: B's four gathers are independent of A's, so they
+/// issue while A's store-forward crossings resolve. The byte masks below
+/// are what make the [`lookup8`] gathers safe — see the module-level
+/// invariant.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn f4(s: &SBoxes4x, x: v128) -> v128 {
+fn f8(s: &SBoxes8x, xa: v128, xb: v128) -> (v128, v128) {
     let byte_mask = u32x4_splat(0xff);
-    let a = u32x4_shr(x, 24);
-    let b = v128_and(u32x4_shr(x, 16), byte_mask);
-    let c = v128_and(u32x4_shr(x, 8), byte_mask);
-    let d = v128_and(x, byte_mask);
-    // SAFETY: every index lane is a byte — `a` by shifting the other bytes
-    // away, `b`/`c`/`d` by the `& 0xff` mask right above — and each
-    // `box_base` points at a real box of `s`, so the module-level lookup
-    // invariant holds at all four gathers.
-    let (va, vb, vc, vd) = unsafe {
+    // SAFETY: both statics are live 16-byte arrays, readable in full.
+    let (off_a, off_b) = unsafe {
         (
-            lookup4(s.box_base(0), a),
-            lookup4(s.box_base(1), b),
-            lookup4(s.box_base(2), c),
-            lookup4(s.box_base(3), d),
+            v128_load(LANE_OFFSETS_A.as_ptr().cast::<v128>()),
+            v128_load(LANE_OFFSETS_B.as_ptr().cast::<v128>()),
         )
     };
-    i32x4_add(v128_xor(i32x4_add(va, vb), vc), vd)
+    // Byte extraction plus the `idx * 8 + lane` pre-scale, all in the
+    // vector domain (two vector ops per byte position per state).
+    let aa = i32x4_add(i32x4_shl(u32x4_shr(xa, 24), 3), off_a);
+    let ab = i32x4_add(i32x4_shl(u32x4_shr(xb, 24), 3), off_b);
+    let ba = i32x4_add(i32x4_shl(v128_and(u32x4_shr(xa, 16), byte_mask), 3), off_a);
+    let bb = i32x4_add(i32x4_shl(v128_and(u32x4_shr(xb, 16), byte_mask), 3), off_b);
+    let ca = i32x4_add(i32x4_shl(v128_and(u32x4_shr(xa, 8), byte_mask), 3), off_a);
+    let cb = i32x4_add(i32x4_shl(v128_and(u32x4_shr(xb, 8), byte_mask), 3), off_b);
+    let da = i32x4_add(i32x4_shl(v128_and(xa, byte_mask), 3), off_a);
+    let db = i32x4_add(i32x4_shl(v128_and(xb, byte_mask), 3), off_b);
+    // SAFETY: every index lane is a pre-scaled byte (`<= 2047`) — the
+    // `>> 24`/`& 0xff` masks plus the `* 8 + lane` scale right above —
+    // and each `box_base` points at a real box of `s`, so the
+    // module-level lookup invariant holds at all eight gathers.
+    let (vaa, vab) = unsafe { lookup8(s.box_base(0), aa, ab) };
+    // SAFETY: lookup invariant — see above.
+    let (vba, vbb) = unsafe { lookup8(s.box_base(1), ba, bb) };
+    // SAFETY: lookup invariant — see above.
+    let (vca, vcb) = unsafe { lookup8(s.box_base(2), ca, cb) };
+    // SAFETY: lookup invariant — see above.
+    let (vda, vdb) = unsafe { lookup8(s.box_base(3), da, db) };
+    (
+        i32x4_add(v128_xor(i32x4_add(vaa, vba), vca), vda),
+        i32x4_add(v128_xor(i32x4_add(vab, vbb), vcb), vdb),
+    )
 }
 
-/// The 16 Feistel rounds of one lockstep encryption, as a macro so every
-/// caller gets a *textually* inlined copy — the same reasoning as
-/// `super::sse41`'s `rounds16!` (an outlined `#[target_feature]` rounds fn
-/// let LLVM keep the box-base math per call). Fully unrolled swap-free
-/// round pairs: the pair ends in reference post-swap orientation, so the
-/// whitening lands on the exchanged registers and the final swap-undo is
-/// the one `mem::swap` after the pairs (register renaming; free).
-macro_rules! rounds16 {
-    ($state:expr, $l:ident, $r:ident) => {{
+/// The 16 Feistel rounds of one X2 lockstep encryption, as a macro so
+/// every caller gets a *textually* inlined copy — the same reasoning as
+/// `super::sse41`'s `rounds16!` (an outlined `#[target_feature]` rounds
+/// fn let LLVM keep the box-base math per call; and `#[inline(always)]`
+/// combined with `#[target_feature]` is a hard error, so the macro route
+/// is the only force-inline one). Fully unrolled swap-free round pairs,
+/// A and B interleaved statement by statement: each pair ends in
+/// reference post-swap orientation, so the whitening lands on the
+/// exchanged registers and the final swap-undo is the one `mem::swap`
+/// per half after the pairs (register renaming; free).
+macro_rules! rounds16x2 {
+    ($state:expr, $la:ident, $ra:ident, $lb:ident, $rb:ident) => {{
         macro_rules! pair {
             ($i:expr) => {{
-                $l = v128_xor($l, $state.p[$i]);
-                $r = v128_xor($r, f4(&$state.s, $l));
-                $r = v128_xor($r, $state.p[$i + 1]);
-                $l = v128_xor($l, f4(&$state.s, $r));
+                $la = v128_xor($la, $state.pa[$i]);
+                $lb = v128_xor($lb, $state.pb[$i]);
+                let (fa, fb) = f8(&$state.s, $la, $lb);
+                $ra = v128_xor($ra, fa);
+                $rb = v128_xor($rb, fb);
+                $ra = v128_xor($ra, $state.pa[$i + 1]);
+                $rb = v128_xor($rb, $state.pb[$i + 1]);
+                let (fa, fb) = f8(&$state.s, $ra, $rb);
+                $la = v128_xor($la, fa);
+                $lb = v128_xor($lb, fb);
             }};
         }
         pair!(0);
@@ -171,66 +287,95 @@ macro_rules! rounds16 {
         pair!(10);
         pair!(12);
         pair!(14);
-        $l = v128_xor($l, $state.p[16]);
-        $r = v128_xor($r, $state.p[17]);
-        core::mem::swap(&mut $l, &mut $r);
+        $la = v128_xor($la, $state.pa[16]);
+        $lb = v128_xor($lb, $state.pb[16]);
+        $ra = v128_xor($ra, $state.pa[17]);
+        $rb = v128_xor($rb, $state.pb[17]);
+        core::mem::swap(&mut $la, &mut $ra);
+        core::mem::swap(&mut $lb, &mut $rb);
     }};
 }
 
-/// One Blowfish block encryption, four lanes in lockstep: 16 Feistel
-/// rounds with the final swap undone, the output halves whitened by
-/// P[16]/P[17] — identical control flow to scalar `encipher`.
+/// One Blowfish block encryption, eight lanes as two interleaved
+/// four-lane states: 16 Feistel rounds with the final swap undone, the
+/// output halves whitened by P[16]/P[17] — identical control flow to
+/// scalar `encipher`, twice.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn encipher4(state: &State4x, mut l: v128, mut r: v128) -> (v128, v128) {
-    rounds16!(state, l, r);
-    (l, r)
+fn encipher8(
+    state: &State8x,
+    mut la: v128,
+    mut ra: v128,
+    mut lb: v128,
+    mut rb: v128,
+) -> (v128, v128, v128, v128) {
+    rounds16x2!(state, la, ra, lb, rb);
+    (la, ra, lb, rb)
 }
 
-/// Lockstep `Blowfish_expandstate`: fresh state from the pi digits with the
-/// key XORed into P, then 521 encryptions mixing salt words into the
-/// running block and writing each ciphertext pair back over P (9 pairs)
-/// and then S (512 pairs).
+/// Lockstep `Blowfish_expandstate` on both half-states: fresh state from
+/// the pi digits with each half's key XORed into its P-array, then 521
+/// encryptions mixing salt words into the running blocks and writing
+/// each ciphertext pair back over P (9 pairs) and then S (512 pairs).
 ///
 /// The salt counter `j` is one continuous stream across **both** loops —
 /// the P loop consumes 18 words, so the first S-box pair XORs `salt[2]`
-/// and `salt[3]`. Faithful to scalar `expand_state`; do not "tidy" the
-/// counter into the S loop.
+/// and `salt[3]` — and both halves consume the same stream positions,
+/// each with its own transposed salt vectors. Faithful to scalar
+/// `expand_state`; do not "tidy" the counter into the S loop.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn expand_state_v4(state: &mut State4x, swv: &[v128; 4], kwv: &[v128; 18]) {
-    for ((p, &init), &k) in state.p.iter_mut().zip(P_INIT.iter()).zip(kwv.iter()) {
-        *p = v128_xor(u32x4_splat(init), k);
+fn expand_state_v8(
+    state: &mut State8x,
+    swa: &[v128; 4],
+    swb: &[v128; 4],
+    kwa: &[v128; 18],
+    kwb: &[v128; 18],
+) {
+    for (i, &init) in P_INIT.iter().enumerate() {
+        state.pa[i] = v128_xor(u32x4_splat(init), kwa[i]);
+        state.pb[i] = v128_xor(u32x4_splat(init), kwb[i]);
     }
     for (entry, &init) in state.s.0.iter_mut().zip(S_INIT.as_flattened().iter()) {
-        *entry = [init; 4];
+        *entry = [init; 8];
     }
     let zero = u32x4_splat(0);
-    let (mut l, mut r) = (zero, zero);
+    let (mut la, mut ra, mut lb, mut rb) = (zero, zero, zero, zero);
     let mut j = 0usize;
     for pair in 0..9 {
-        l = v128_xor(l, swv[j % 4]);
+        la = v128_xor(la, swa[j % 4]);
+        lb = v128_xor(lb, swb[j % 4]);
         j += 1;
-        r = v128_xor(r, swv[j % 4]);
+        ra = v128_xor(ra, swa[j % 4]);
+        rb = v128_xor(rb, swb[j % 4]);
         j += 1;
-        rounds16!(state, l, r);
-        state.p[2 * pair] = l;
-        state.p[2 * pair + 1] = r;
+        rounds16x2!(state, la, ra, lb, rb);
+        state.pa[2 * pair] = la;
+        state.pa[2 * pair + 1] = ra;
+        state.pb[2 * pair] = lb;
+        state.pb[2 * pair + 1] = rb;
     }
     for b in 0..4 {
         for pair in 0..128 {
-            l = v128_xor(l, swv[j % 4]);
+            la = v128_xor(la, swa[j % 4]);
+            lb = v128_xor(lb, swb[j % 4]);
             j += 1;
-            r = v128_xor(r, swv[j % 4]);
+            ra = v128_xor(ra, swa[j % 4]);
+            rb = v128_xor(rb, swb[j % 4]);
             j += 1;
-            rounds16!(state, l, r);
+            rounds16x2!(state, la, ra, lb, rb);
             let e = b * 256 + 2 * pair;
-            // SAFETY: entries `e`/`e + 1` are 16-byte aligned by
-            // construction (struct align 64, entry stride 16) and
-            // exclusively owned — `v128_store` writes the full vectors.
+            // SAFETY: both 16-byte halves of entries `e`/`e + 1` are
+            // 16-byte aligned by construction (struct align 64, entry
+            // stride 32) and exclusively owned — each `v128_store`
+            // writes a full half.
             unsafe {
-                v128_store(state.s.0[e].as_mut_ptr().cast::<v128>(), l);
-                v128_store(state.s.0[e + 1].as_mut_ptr().cast::<v128>(), r);
+                let e0 = state.s.0[e].as_mut_ptr();
+                v128_store(e0.cast::<v128>(), la);
+                v128_store(e0.add(4).cast::<v128>(), lb);
+                let e1 = state.s.0[e + 1].as_mut_ptr();
+                v128_store(e1.cast::<v128>(), ra);
+                v128_store(e1.add(4).cast::<v128>(), rb);
             }
         }
     }
@@ -238,98 +383,135 @@ fn expand_state_v4(state: &mut State4x, swv: &[v128; 4], kwv: &[v128; 18]) {
 
 /// The 521-encryption zero chain shared by both lockstep `expand0state`
 /// variants: overwrite P (9 pairs) then S (512 pairs) exactly as
-/// [`expand_state_v4`] does, minus the salt mixing.
+/// [`expand_state_v8`] does, minus the salt mixing.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn encrypt_zero_chain_v4(state: &mut State4x) {
+fn encrypt_zero_chain_v8(state: &mut State8x) {
     let zero = u32x4_splat(0);
-    let (mut l, mut r) = (zero, zero);
+    let (mut la, mut ra, mut lb, mut rb) = (zero, zero, zero, zero);
     for pair in 0..9 {
-        rounds16!(state, l, r);
-        state.p[2 * pair] = l;
-        state.p[2 * pair + 1] = r;
+        rounds16x2!(state, la, ra, lb, rb);
+        state.pa[2 * pair] = la;
+        state.pa[2 * pair + 1] = ra;
+        state.pb[2 * pair] = lb;
+        state.pb[2 * pair + 1] = rb;
     }
     for b in 0..4 {
         for pair in 0..128 {
-            rounds16!(state, l, r);
+            rounds16x2!(state, la, ra, lb, rb);
             let e = b * 256 + 2 * pair;
-            // SAFETY: same argument as `expand_state_v4` — 16-byte aligned,
-            // exclusively owned entries.
+            // SAFETY: same argument as `expand_state_v8` — aligned,
+            // exclusively owned entry halves.
             unsafe {
-                v128_store(state.s.0[e].as_mut_ptr().cast::<v128>(), l);
-                v128_store(state.s.0[e + 1].as_mut_ptr().cast::<v128>(), r);
+                let e0 = state.s.0[e].as_mut_ptr();
+                v128_store(e0.cast::<v128>(), la);
+                v128_store(e0.add(4).cast::<v128>(), lb);
+                let e1 = state.s.0[e + 1].as_mut_ptr();
+                v128_store(e1.cast::<v128>(), ra);
+                v128_store(e1.add(4).cast::<v128>(), rb);
             }
         }
     }
 }
 
-/// Lockstep `Blowfish_expand0state(key)`: XOR the password words into P,
-/// then run the zero chain.
+/// Lockstep `Blowfish_expand0state(key)`: XOR each half's password words
+/// into its P-array, then run the zero chain.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn expand0state_v4(state: &mut State4x, wv: &[v128; 18]) {
-    for (p, &w) in state.p.iter_mut().zip(wv.iter()) {
-        *p = v128_xor(*p, w);
+fn expand0state_v8(state: &mut State8x, kwa: &[v128; 18], kwb: &[v128; 18]) {
+    for ((pa, pb), (&ka, &kb)) in state
+        .pa
+        .iter_mut()
+        .zip(state.pb.iter_mut())
+        .zip(kwa.iter().zip(kwb.iter()))
+    {
+        *pa = v128_xor(*pa, ka);
+        *pb = v128_xor(*pb, kb);
     }
-    encrypt_zero_chain_v4(state);
+    encrypt_zero_chain_v8(state);
 }
 
-/// Lockstep `Blowfish_expand0state(salt)`: the salt is exactly 4 words, so
-/// the P XOR cycles it (`i & 3`), then the same zero chain.
+/// Lockstep `Blowfish_expand0state(salt)`: the salt is exactly 4 words,
+/// so the P XOR cycles it (`i & 3`), then the same zero chain.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn expand0state_salt_v4(state: &mut State4x, swv: &[v128; 4]) {
-    for (i, p) in state.p.iter_mut().enumerate() {
-        *p = v128_xor(*p, swv[i & 3]);
+fn expand0state_salt_v8(state: &mut State8x, swa: &[v128; 4], swb: &[v128; 4]) {
+    for (i, (pa, pb)) in state.pa.iter_mut().zip(state.pb.iter_mut()).enumerate() {
+        *pa = v128_xor(*pa, swa[i & 3]);
+        *pb = v128_xor(*pb, swb[i & 3]);
     }
-    encrypt_zero_chain_v4(state);
+    encrypt_zero_chain_v8(state);
 }
 
-/// Transpose the four lanes' key words into 18 vectors: vector `i` holds
-/// word `i` of lanes 0..=3. wasm has no `setr`-style intrinsic, so each
+/// Transpose the eight lanes' key words into the two 18-vector
+/// schedules: A vector `i` holds word `i` of lanes 0..=3, B vector `i`
+/// word `i` of lanes 4..=7. wasm has no `setr`-style intrinsic, so each
 /// vector is a plain 16-byte stack load — fine here, as nothing in this
 /// function is on the cost-loop path.
 #[target_feature(enable = "simd128")]
 #[inline]
-fn transpose_keys(key_words: &[[u32; 18]]) -> [v128; 18] {
+fn transpose_keys(key_words: &[[u32; 18]]) -> ([v128; 18], [v128; 18]) {
     debug_assert_eq!(key_words.len(), LANES);
-    let mut out = [u32x4_splat(0); 18];
-    for (i, v) in out.iter_mut().enumerate() {
-        let words = [
+    let mut a = [u32x4_splat(0); 18];
+    let mut b = [u32x4_splat(0); 18];
+    for (i, (va, vb)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+        let wa = [
             key_words[0][i],
             key_words[1][i],
             key_words[2][i],
             key_words[3][i],
         ];
-        // SAFETY: `words` is a live 16-byte stack array, readable in full.
-        *v = unsafe { v128_load(words.as_ptr().cast::<v128>()) };
+        let wb = [
+            key_words[4][i],
+            key_words[5][i],
+            key_words[6][i],
+            key_words[7][i],
+        ];
+        // SAFETY: `wa`/`wb` are live 16-byte stack arrays, readable in
+        // full.
+        unsafe {
+            *va = v128_load(wa.as_ptr().cast::<v128>());
+            *vb = v128_load(wb.as_ptr().cast::<v128>());
+        }
     }
-    out
+    (a, b)
 }
 
-/// Transpose the four lanes' salt words into 4 vectors; see
+/// Transpose the eight lanes' salt words into the two 4-vector sets; see
 /// [`transpose_keys`].
 #[target_feature(enable = "simd128")]
 #[inline]
-fn transpose_salts(salt_words: &[[u32; 4]]) -> [v128; 4] {
+fn transpose_salts(salt_words: &[[u32; 4]]) -> ([v128; 4], [v128; 4]) {
     debug_assert_eq!(salt_words.len(), LANES);
-    let mut out = [u32x4_splat(0); 4];
-    for (i, v) in out.iter_mut().enumerate() {
-        let words = [
+    let mut a = [u32x4_splat(0); 4];
+    let mut b = [u32x4_splat(0); 4];
+    for (i, (va, vb)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+        let wa = [
             salt_words[0][i],
             salt_words[1][i],
             salt_words[2][i],
             salt_words[3][i],
         ];
-        // SAFETY: `words` is a live 16-byte stack array, readable in full.
-        *v = unsafe { v128_load(words.as_ptr().cast::<v128>()) };
+        let wb = [
+            salt_words[4][i],
+            salt_words[5][i],
+            salt_words[6][i],
+            salt_words[7][i],
+        ];
+        // SAFETY: `wa`/`wb` are live 16-byte stack arrays, readable in
+        // full.
+        unsafe {
+            *va = v128_load(wa.as_ptr().cast::<v128>());
+            *vb = v128_load(wb.as_ptr().cast::<v128>());
+        }
     }
-    out
+    (a, b)
 }
 
 /// The whole lockstep bcrypt: one key+salt expansion, `2^cost` rounds of
 /// key-then-salt expansion (OpenBSD order), then 64 encryptions of the
-/// "OrpheanBeholderScryDoubt" constant and a big-endian store per lane.
+/// "OrpheanBeholderScryDoubt" constant and a big-endian store per lane —
+/// for both half-states at once.
 ///
 /// Every kernel function carries the same `#[target_feature(enable =
 /// "simd128")]` scope — stdarch annotates the SIMD128 intrinsics, and a
@@ -357,20 +539,21 @@ unsafe fn bcrypt_lanes_impl(
     debug_assert_eq!(outs.len(), LANES);
     // `mut` serves only the `zeroize` wipe at the bottom of this fn.
     #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
-    let mut kwv = transpose_keys(key_words);
-    let swv = transpose_salts(salt_words);
-    let mut state = State4x {
-        p: [u32x4_splat(0); 18],
-        s: SBoxes4x([[0; 4]; 1024]),
+    let (mut kwa, mut kwb) = transpose_keys(key_words);
+    let (swa, swb) = transpose_salts(salt_words);
+    let mut state = State8x {
+        pa: [u32x4_splat(0); 18],
+        pb: [u32x4_splat(0); 18],
+        s: SBoxes8x([[0; 8]; 1024]),
     };
-    expand_state_v4(&mut state, &swv, &kwv);
+    expand_state_v8(&mut state, &swa, &swb, &kwa, &kwb);
     for _ in 0..(1u64 << cost) {
         // OpenBSD order: the password expansion first, the salt second.
-        expand0state_v4(&mut state, &kwv);
-        expand0state_salt_v4(&mut state, &swv);
+        expand0state_v8(&mut state, &kwa, &kwb);
+        expand0state_salt_v8(&mut state, &swa, &swb);
     }
-    // "OrpheanBeholderScryDoubt" as six broadcast words.
-    let mut cdata = [
+    // "OrpheanBeholderScryDoubt" as six broadcast words, per half-state.
+    let mut ca = [
         u32x4_splat(0x4f72_7068),
         u32x4_splat(0x6561_6e42),
         u32x4_splat(0x6568_6f6c),
@@ -378,48 +561,74 @@ unsafe fn bcrypt_lanes_impl(
         u32x4_splat(0x6372_7944),
         u32x4_splat(0x6f75_6274),
     ];
+    let mut cb = ca;
     for _ in 0..64 {
         for pair in 0..3 {
-            let (l, r) = encipher4(&state, cdata[2 * pair], cdata[2 * pair + 1]);
-            cdata[2 * pair] = l;
-            cdata[2 * pair + 1] = r;
+            let (la, ra, lb, rb) = encipher8(
+                &state,
+                ca[2 * pair],
+                ca[2 * pair + 1],
+                cb[2 * pair],
+                cb[2 * pair + 1],
+            );
+            ca[2 * pair] = la;
+            ca[2 * pair + 1] = ra;
+            cb[2 * pair] = lb;
+            cb[2 * pair + 1] = rb;
         }
     }
     // Split the lanes back out: word `w` of lane `l`'s output is lane `l`
-    // of `cdata[w]`, stored big-endian.
-    for (w, &cv) in cdata.iter().enumerate() {
-        let mut words = [0u32; 4];
-        // SAFETY: `words` is a live 16-byte stack array, writable in full.
-        unsafe { v128_store(words.as_mut_ptr().cast::<v128>(), cv) };
+    // of the A image for lanes 0..=3, lane `l - 4` of the B image for
+    // lanes 4..=7 — one side-by-side store, eight big-endian word stores.
+    for w in 0..6 {
+        let mut words = [0u32; 8];
+        // SAFETY: `words` is a live 32-byte stack array; the two stores
+        // cover its bytes 0..16 and 16..32 in full.
+        unsafe {
+            v128_store(words.as_mut_ptr().cast::<v128>(), ca[w]);
+            v128_store(words.as_mut_ptr().add(4).cast::<v128>(), cb[w]);
+        }
         for (lane, out) in outs.iter_mut().enumerate() {
             out[4 * w..4 * w + 4].copy_from_slice(&words[lane].to_be_bytes());
         }
     }
     #[cfg(feature = "zeroize")]
     {
-        // SAFETY: a `v128` is four `u32`s, so the `*mut u32` view
-        // covers exactly the same exclusively-owned stack bytes as `state.p`.
+        // SAFETY: a `v128` is four `u32`s, so the `*mut u32` view covers
+        // exactly the same exclusively-owned stack bytes as `state.pa`.
         crate::wipe::secure_wipe_u32(unsafe {
-            core::slice::from_raw_parts_mut(state.p.as_mut_ptr().cast::<u32>(), 18 * 4)
+            core::slice::from_raw_parts_mut(state.pa.as_mut_ptr().cast::<u32>(), 18 * 4)
+        });
+        // SAFETY: same reinterpretation as above, for `state.pb`.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(state.pb.as_mut_ptr().cast::<u32>(), 18 * 4)
         });
         crate::wipe::secure_wipe_u32(state.s.0.as_flattened_mut());
-        // SAFETY: same reinterpretation as above, for the six `cdata`
+        // SAFETY: same reinterpretation as above, for the six `ca`
         // vectors: 24 exclusively-owned stack words, valid for writes.
         crate::wipe::secure_wipe_u32(unsafe {
-            core::slice::from_raw_parts_mut(cdata.as_mut_ptr().cast::<u32>(), 6 * 4)
+            core::slice::from_raw_parts_mut(ca.as_mut_ptr().cast::<u32>(), 6 * 4)
         });
-        // `kwv` is the transposed key schedule — all four lanes'
-        // password-derived key words — so it is wiped with the state.
-        // SAFETY: same reinterpretation as above, for the eighteen `kwv`
+        // SAFETY: same reinterpretation as above, for `cb`.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(cb.as_mut_ptr().cast::<u32>(), 6 * 4)
+        });
+        // `kwa`/`kwb` are the transposed key schedule — all eight lanes'
+        // password-derived key words — so they are wiped with the state.
+        // SAFETY: same reinterpretation as above, for the eighteen `kwa`
         // vectors: 72 exclusively-owned stack words, valid for writes.
         crate::wipe::secure_wipe_u32(unsafe {
-            core::slice::from_raw_parts_mut(kwv.as_mut_ptr().cast::<u32>(), 18 * 4)
+            core::slice::from_raw_parts_mut(kwa.as_mut_ptr().cast::<u32>(), 18 * 4)
+        });
+        // SAFETY: same reinterpretation as above, for `kwb`.
+        crate::wipe::secure_wipe_u32(unsafe {
+            core::slice::from_raw_parts_mut(kwb.as_mut_ptr().cast::<u32>(), 18 * 4)
         });
     }
 }
 
-/// The SIMD128 batch kernel: [`LANES`] independent bcrypt hashes in
-/// lockstep, one per 32-bit vector lane.
+/// The SIMD128 batch kernel: [`LANES`] independent bcrypt hashes as two
+/// interleaved four-lane `v128` states (X2 — see the module docs).
 ///
 /// Implements the [`super::BcryptLanesFn`] contract for
 /// [`super::Backend::Wasm128`]: `cost` is `4..=31` (validated upstream in
@@ -449,7 +658,7 @@ pub unsafe fn bcrypt_lanes(
     debug_assert_eq!(salt_words.len(), LANES);
     debug_assert_eq!(outs.len(), LANES);
     // SAFETY: the caller upholds the `BcryptLanesFn` contract — SIMD128 is
-    // available in this engine and the three slices are exactly 4 lanes
+    // available in this engine and the three slices are exactly 8 lanes
     // each — which is everything `bcrypt_lanes_impl` requires.
     unsafe { bcrypt_lanes_impl(cost, key_words, salt_words, outs) }
 }
@@ -495,9 +704,10 @@ mod tests {
         );
     }
 
-    /// Four different passwords and four different salts, one per lane,
-    /// must reproduce four scalar hashes bit for bit — including the
-    /// OpenBSD `U*U` vector in lane 1.
+    /// Eight different passwords and eight different salts, one per lane,
+    /// must reproduce eight scalar hashes bit for bit — including the
+    /// OpenBSD `U*U` vector in lane 1 and the A/B half boundary (lanes 3
+    /// and 4 must not leak into each other).
     #[test]
     fn lanes_match_scalar() {
         if !wasm128_available() {
@@ -505,16 +715,29 @@ mod tests {
         }
         let vector_salt =
             base64::decode_16(b"CCCCCCCCCCCCCCCCCCCCC.").expect("test salt must decode");
-        let passwords: [&[u8]; 4] = [b"", b"U*U", b"hunter2", &[0xAA; 72]];
-        let kws: [[u32; 18]; 4] = core::array::from_fn(|i| key_words_for(passwords[i]));
-        let sws: [[u32; 4]; 4] = [
+        let passwords: [&[u8]; 8] = [
+            b"",
+            b"U*U",
+            b"hunter2",
+            &[0xAA; 72],
+            b"correct horse battery staple",
+            &[0x00; 1],
+            b"\xff\xfe\xfd binary",
+            b"a",
+        ];
+        let kws: [[u32; 18]; 8] = core::array::from_fn(|i| key_words_for(passwords[i]));
+        let sws: [[u32; 4]; 8] = [
             salt_words(&[0x11; 16]),
             salt_words(&vector_salt),
             salt_words(&[0x33; 16]),
             salt_words(&[0x44; 16]),
+            salt_words(&[0x55; 16]),
+            salt_words(&[0x66; 16]),
+            salt_words(&[0x77; 16]),
+            salt_words(&[0x88; 16]),
         ];
-        let mut outs = [[0u8; 24]; 4];
-        // SAFETY: availability checked above; the slices are exactly 4 lanes.
+        let mut outs = [[0u8; 24]; 8];
+        // SAFETY: availability checked above; the slices are exactly 8 lanes.
         unsafe { bcrypt_lanes(5, &kws, &sws, &mut outs) };
         for lane in 0..LANES {
             let mut expected = [0u8; 24];

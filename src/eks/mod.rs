@@ -94,7 +94,7 @@ pub mod wasm128;
 pub enum Backend {
     /// Portable scalar code, one lane. Always available.
     Scalar = 0,
-    /// AArch64 NEON, 4 lanes.
+    /// AArch64 NEON, 8 lanes.
     Neon = 1,
     /// x86 / x86-64 SSE4.1 (`pinsrd`/`pextrd` for lane construction), 4 lanes.
     Sse41 = 2,
@@ -104,7 +104,8 @@ pub enum Backend {
     Avx2 = 3,
     /// x86-64 AVX-512F, 16 lanes. Same flavour shootout as AVX2.
     Avx512 = 4,
-    /// wasm32 fixed-width SIMD128, 4 lanes. Compile-time selected.
+    /// wasm32 fixed-width SIMD128, 8 lanes as two interleaved 4-lane
+    /// `v128` states (X2). Compile-time selected.
     Wasm128 = 5,
 }
 
@@ -155,11 +156,18 @@ impl Backend {
     pub const fn lanes(self) -> usize {
         match self {
             Backend::Scalar => 1,
-            Backend::Neon => 4,
+            Backend::Neon => 8,
             Backend::Sse41 => 4,
             Backend::Avx2 => 8,
             Backend::Avx512 => 16,
-            Backend::Wasm128 => 4,
+            // The kernel's lane count lives next to the kernel; the
+            // module only exists on simd128-enabled wasm32, so off-arch
+            // builds keep the constant inline (the backend is never
+            // available there — the value is dead).
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            Backend::Wasm128 => wasm128::LANES,
+            #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+            Backend::Wasm128 => 8,
         }
     }
 
