@@ -16,42 +16,53 @@
 //! lookup reads `box_base[idx_l * 8 + l]`. Unlike NEON, AVX2 *has* a
 //! gather instruction — which is not always the fast choice.
 //!
-//! # Two lookup flavors, measured not assumed
+//! # Three lookup flavors, measured not assumed
 //!
 //! * **Gather** — [`lookup8_gather`], one `vpgatherdd` per box. Fast on
 //!   Intel (hardware gather); on AMD Zen 2–4 `vpgatherdd` is microcoded
 //!   and loses ~2–3× to scalar loads.
-//! * **Insert** — [`lookup8_insert`]: store the index vector, eight scalar
-//!   loads, load the result back. On Intel this runs ~10–20 % behind the
-//!   hardware gather.
+//! * **Insert** — [`lookup8_insert!`]: store the prescaled byte-offset
+//!   vector, eight scalar loads, load the result back. On Intel this runs
+//!   ~10–20 % behind the hardware gather.
+//! * **Extract** — [`lookup8_extract!`]: `vpextrd` each prescaled offset
+//!   lane to a GPR, scalar load, `vpinsrd` rebuild — no stack round-trip
+//!   and no store-forward link at all (the shape LLVM's optimizer
+//!   usually — but not reliably — turns Insert into).
 //!
-//! With `std` and optimized code a one-time shootout picks per CPU: both
-//! flavors hash the same fixed group at cost 4 (outputs asserted identical
-//! — a mismatch is a kernel bug), three interleaved reps each, min wins,
-//! cached in [`CACHED_FLAVOR`]. Without `std` there is no clock, and in
-//! debug builds or under Miri timing measures the codegen mode, not the
-//! µarch — those builds take **Insert**, the minimax default: guessing
-//! wrong costs ~10–20 % on Intel, while the other wrong guess costs 2–3×
-//! on Zen. [`bcrypt_lanes`] reads the cache once per call and branches
-//! once per **group** into two monomorphized kernel paths
-//! (`bcrypt8::<true>` / `bcrypt8::<false>`), so no per-lookup branch
-//! exists.
+//! With `std` and optimized code a one-time shootout picks per CPU: all
+//! flavors hash the same fixed group at cost 4 (outputs asserted
+//! identical — a mismatch is a kernel bug), three interleaved reps each,
+//! min wins, cached in [`CACHED_FLAVOR`]. Without `std` there is no
+//! clock, and in debug builds or under Miri timing measures the codegen
+//! mode, not the µarch — those builds take **Insert**, the minimax
+//! default: with no microcoded instructions it stays within ~10–15 %
+//! of the winner wherever measured (on Zen 4 Gather wins by ~12 %);
+//! Gather's standing swings with µarch and toolchain, so it is only
+//! ever picked by measurement.
+//!
+//! [`bcrypt_lanes`] reads the cache once per call and branches once per
+//! **group** into three monomorphized kernel paths
+//! (`bcrypt8::<FLAVOR_GATHER>` / `::<FLAVOR_INSERT>` /
+//! `::<FLAVOR_EXTRACT>`), so no per-lookup branch exists.
 //!
 //! # Rosetta note
 //!
 //! Rosetta 2 (the dev host's only way to run this) executes AVX2 but
-//! translates `vpgatherdd` poorly, so the shootout is expected to pick
-//! Insert there. Rosetta numbers are translation-bound: correctness is the
-//! gate under Rosetta, not speed.
+//! translates `vpgatherdd` poorly, so the shootout is expected to pick a
+//! scalar-load flavor there. Rosetta numbers are translation-bound:
+//! correctness is the gate under Rosetta, not speed.
 //!
 //! # Lookup invariant
 //!
-//! Every index vector handed to the lookups is a byte-masked value (a
-//! `>> 24` or `& 0xff` of a `u32` lane) produced inside [`f8_gather`] /
-//! [`f8_insert`], so every lane is in `0..=255` and `idx * 8 + lane` stays
-//! inside the addressed 256-entry box — a gather can never leave the
-//! 32 KiB [`SBoxes8`]. The invariant is stated once here and referenced at
-//! every unsafe dereference below.
+//! Every index vector handed to the lookups is derived from a byte-masked
+//! value (a `>> 24` or `& 0xff` of a `u32` lane) produced inside
+//! [`f8_gather`] / [`f8_insert!`] / [`f8_extract!`]. The gather flavor
+//! receives the byte itself (`0..=255`), so `idx * 8 + lane` stays inside
+//! the addressed 256-entry box; the insert and extract flavors receive it
+//! prescaled to a byte offset (`idx * 32`, via an `& 0x1fe0` mask), so
+//! `off + lane * 4` stays inside the box's 8 KiB. Either way a lookup can
+//! never leave the 32 KiB [`SBoxes8`]. The invariant is stated once here
+//! and referenced at every unsafe dereference below.
 //!
 //! # Zeroization
 //!
@@ -62,9 +73,10 @@
 //! not chased.
 
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_i32gather_epi32, _mm256_loadu_si256,
-    _mm256_set1_epi32, _mm256_setr_epi32, _mm256_setzero_si256, _mm256_slli_epi32,
-    _mm256_srli_epi32, _mm256_store_si256, _mm256_storeu_si256, _mm256_xor_si256,
+    __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_extract_epi32, _mm256_i32gather_epi32,
+    _mm256_insert_epi32, _mm256_loadu_si256, _mm256_set1_epi32, _mm256_setr_epi32,
+    _mm256_setzero_si256, _mm256_slli_epi32, _mm256_srli_epi32, _mm256_store_si256,
+    _mm256_storeu_si256, _mm256_xor_si256,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -98,6 +110,27 @@ struct State8 {
     s: SBoxes8,
 }
 
+/// One scalar S-box load: `$base` (a box pointer) + `$byte_off`, with a
+/// zero-instruction opaque `asm!` identity on the address. Uniform
+/// `base + off` scalar loads are a gather pattern LLVM can re-form into a
+/// microcoded `vpgather*q` (it did for the 16-lane sibling under rustc
+/// 1.99 — the very instruction the scalar-load flavors exist to avoid).
+/// The blocker keeps every load scalar — the same SLP blocker
+/// `super::neon` uses. The caller wraps the invocation in `unsafe` and
+/// guarantees the module-level lookup invariant (the address stays inside
+/// the addressed box and is 4-aligned).
+macro_rules! lane_load {
+    ($base:expr, $byte_off:expr) => {{
+        let mut a = $base as usize + $byte_off;
+        core::arch::asm!(
+            "/* {0} */",
+            inout(reg) a,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        *(a as *const u32)
+    }};
+}
+
 /// Gather one S-box word per lane with the hardware gather: lane `l` loads
 /// `box_base[idx_l * 8 + l]` — vindex `idx * 8 + {0..8}`, scale 4, i.e.
 /// byte offset `(idx * 8 + lane) * 4`. `lane_off` is hoisted by the caller
@@ -118,40 +151,102 @@ unsafe fn lookup8_gather(box_base: *const i32, idx: __m256i, lane_off: __m256i) 
     unsafe { _mm256_i32gather_epi32::<4>(box_base, vindex) }
 }
 
-/// Gather one S-box word per lane without `vpgatherdd`: store the index
-/// vector to the stack, eight scalar loads in GPR code, load the result
-/// back. The flavor that wins where gathers are microcoded.
+/// Gather one S-box word per lane without `vpgatherdd`, as a MACRO so
+/// every call site gets a textually inlined copy: store the *prescaled*
+/// byte-offset vector to the stack, eight scalar loads in GPR code, load
+/// the result back. `$off` lane `l` must already hold the byte offset
+/// `idx_l * 32` (the [`SBoxes8`] entry stride) — prescaling in vector
+/// form in [`f8_insert!`] removes the per-lane GPR `shl` chains the
+/// word-index spelling needed, so every load here is displacement-only.
+/// The flavor that wins where gathers are microcoded.
+///
+/// A macro because LLVM refuses to inline the scalar-load F flavors into
+/// the unrolled zero chain: as fns they compiled to 16 outlined `callq`
+/// per encipher, and `#[inline(always)]` on a `#[target_feature]` fn is
+/// a hard error (rust#145574) — the `rounds16!` reasoning, one level
+/// down.
 ///
 /// # Safety
 ///
-/// Same contract as [`lookup8_gather`].
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn lookup8_insert(box_base: *const u32, idx: __m256i) -> __m256i {
-    let mut ix = [0u32; 8];
-    // SAFETY: `ix` is a live 32-byte stack array, writable in full.
-    unsafe { _mm256_storeu_si256(ix.as_mut_ptr().cast::<__m256i>(), idx) };
-    let gathered = [
-        // SAFETY: lookup invariant — `ix[l] <= 255`, so `ix[l] * 8 + l`
-        // stays inside the box `box_base` points at (repeated per load).
-        unsafe { *box_base.add(ix[0] as usize * 8) },
+/// `$box_base` must evaluate to the first word of one 256-entry box of an
+/// [`SBoxes8`], and every lane of `$off` must be a multiple of 32 in
+/// `0..=8160` — the module-level lookup invariant, prescaled. Then
+/// `off_l + l * 4 <= 8188` is a 4-aligned byte offset inside that box's
+/// 8 KiB.
+macro_rules! lookup8_insert {
+    ($box_base:expr, $off:expr) => {{
+        let base = ($box_base).cast::<u8>();
+        let mut offs = [0u32; 8];
+        // SAFETY: `offs` is a live 32-byte stack array, writable in full.
+        unsafe { _mm256_storeu_si256(offs.as_mut_ptr().cast::<__m256i>(), $off) };
+        let gathered = [
+            // SAFETY: lookup invariant (prescaled) — `offs[l]` is a
+            // multiple of 32 at most 8160, so `offs[l] + l * 4` is a
+            // 4-aligned byte offset inside the box `base` points at
+            // (repeated per load).
+            unsafe { lane_load!(base, offs[0] as usize) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[1] as usize + 4) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[2] as usize + 8) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[3] as usize + 12) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[4] as usize + 16) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[5] as usize + 20) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[6] as usize + 24) },
+            // SAFETY: lookup invariant — see lane 0.
+            unsafe { lane_load!(base, offs[7] as usize + 28) },
+        ];
+        // SAFETY: `gathered` is a live 32-byte stack array, readable in
+        // full.
+        unsafe { _mm256_loadu_si256(gathered.as_ptr().cast::<__m256i>()) }
+    }};
+}
+
+/// [`lookup8_insert!`] without the stack round-trip, as a MACRO (same
+/// force-inline reasoning): `vpextrd` each prescaled offset lane to a
+/// GPR, scalar load, `vpinsrd` rebuild into a vector register. Removes
+/// the store-forward link entirely — the shape LLVM's optimizer usually,
+/// but not reliably, turns Insert into.
+///
+/// # Safety
+///
+/// Same contract as [`lookup8_insert!`].
+macro_rules! lookup8_extract {
+    ($box_base:expr, $off:expr) => {{
+        let base = ($box_base).cast::<u8>();
+        let off = $off;
+        // SAFETY: lookup invariant (prescaled), repeated per lane — every
+        // extracted lane is a multiple of 32 at most 8160, so `+ l * 4`
+        // is a 4-aligned byte offset inside the box `base` points at.
+        let g0 = unsafe { lane_load!(base, _mm256_extract_epi32::<0>(off) as usize) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[1] as usize * 8 + 1) },
+        let g1 = unsafe { lane_load!(base, _mm256_extract_epi32::<1>(off) as usize + 4) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[2] as usize * 8 + 2) },
+        let g2 = unsafe { lane_load!(base, _mm256_extract_epi32::<2>(off) as usize + 8) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[3] as usize * 8 + 3) },
+        let g3 = unsafe { lane_load!(base, _mm256_extract_epi32::<3>(off) as usize + 12) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[4] as usize * 8 + 4) },
+        let g4 = unsafe { lane_load!(base, _mm256_extract_epi32::<4>(off) as usize + 16) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[5] as usize * 8 + 5) },
+        let g5 = unsafe { lane_load!(base, _mm256_extract_epi32::<5>(off) as usize + 20) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[6] as usize * 8 + 6) },
+        let g6 = unsafe { lane_load!(base, _mm256_extract_epi32::<6>(off) as usize + 24) };
         // SAFETY: lookup invariant — see lane 0.
-        unsafe { *box_base.add(ix[7] as usize * 8 + 7) },
-    ];
-    // SAFETY: `gathered` is a live 32-byte stack array, readable in full.
-    unsafe { _mm256_loadu_si256(gathered.as_ptr().cast::<__m256i>()) }
+        let g7 = unsafe { lane_load!(base, _mm256_extract_epi32::<7>(off) as usize + 28) };
+        let mut v = _mm256_setzero_si256();
+        v = _mm256_insert_epi32::<0>(v, g0 as i32);
+        v = _mm256_insert_epi32::<1>(v, g1 as i32);
+        v = _mm256_insert_epi32::<2>(v, g2 as i32);
+        v = _mm256_insert_epi32::<3>(v, g3 as i32);
+        v = _mm256_insert_epi32::<4>(v, g4 as i32);
+        v = _mm256_insert_epi32::<5>(v, g5 as i32);
+        v = _mm256_insert_epi32::<6>(v, g6 as i32);
+        _mm256_insert_epi32::<7>(v, g7 as i32)
+    }};
 }
 
 /// The Blowfish round function, lane-wise, gather flavor:
@@ -184,36 +279,80 @@ fn f8_gather(s: &SBoxes8, x: __m256i) -> __m256i {
     _mm256_add_epi32(_mm256_xor_si256(_mm256_add_epi32(va, vb), vc), vd)
 }
 
-/// [`f8_gather`], insert flavor: identical math through
-/// [`lookup8_insert`] — see the module-level flavor notes.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn f8_insert(s: &SBoxes8, x: __m256i) -> __m256i {
-    let byte_mask = _mm256_set1_epi32(0xff);
-    let a = _mm256_srli_epi32::<24>(x);
-    let b = _mm256_and_si256(_mm256_srli_epi32::<16>(x), byte_mask);
-    let c = _mm256_and_si256(_mm256_srli_epi32::<8>(x), byte_mask);
-    let d = _mm256_and_si256(x, byte_mask);
-    // SAFETY: same argument as `f8_gather` — byte-masked indices into real
-    // boxes, so the module-level lookup invariant holds at all four loads.
-    let (va, vb, vc, vd) = unsafe {
-        (
-            lookup8_insert(s.box_base(0), a),
-            lookup8_insert(s.box_base(1), b),
-            lookup8_insert(s.box_base(2), c),
-            lookup8_insert(s.box_base(3), d),
-        )
-    };
-    _mm256_add_epi32(_mm256_xor_si256(_mm256_add_epi32(va, vb), vc), vd)
+/// [`f8_gather`], insert flavor, as a MACRO — textually inlined at every
+/// call site for the same reason [`lookup8_insert!`] is a macro (LLVM
+/// outlined the scalar-load F as 16 `callq` per encipher;
+/// `#[inline(always)]` on `#[target_feature]` is a hard error). Identical
+/// math to [`f8_gather`] — see the module-level flavor notes. The byte
+/// extraction folds the ×32 stride into the mask (`0x1fe0 = 0xff << 5`),
+/// so the lookups receive finished byte offsets: `(x >> 19) & 0x1fe0` is
+/// `(x >> 24) * 32`, and so on — 8 vector ops per F instead of 32 GPR
+/// shifts.
+macro_rules! f8_insert {
+    ($s:expr, $x:expr) => {{
+        let s = $s;
+        let x = $x;
+        let stride_mask = _mm256_set1_epi32(0x1fe0);
+        let a = _mm256_and_si256(_mm256_srli_epi32::<19>(x), stride_mask);
+        let b = _mm256_and_si256(_mm256_srli_epi32::<11>(x), stride_mask);
+        let c = _mm256_and_si256(_mm256_srli_epi32::<3>(x), stride_mask);
+        let d = _mm256_and_si256(_mm256_slli_epi32::<5>(x), stride_mask);
+        // Every offset lane is a byte value shifted left by 5 — a
+        // multiple of 32 at most 8160 — and each `box_base` points at a
+        // real box of `s`, so the module-level lookup invariant holds
+        // (prescaled) at all four lookups; that is the contract
+        // `lookup8_insert!`'s internal unsafe blocks rely on.
+        let (va, vb, vc, vd) = (
+            lookup8_insert!(s.box_base(0), a),
+            lookup8_insert!(s.box_base(1), b),
+            lookup8_insert!(s.box_base(2), c),
+            lookup8_insert!(s.box_base(3), d),
+        );
+        _mm256_add_epi32(_mm256_xor_si256(_mm256_add_epi32(va, vb), vc), vd)
+    }};
 }
 
-/// The flavor-dispatched F: `GATHER` is a const generic, so the branch
-/// folds at monomorphization and no per-lookup branch exists in either
-/// kernel path.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn f8<const GATHER: bool>(s: &SBoxes8, x: __m256i) -> __m256i {
-    if GATHER { f8_gather(s, x) } else { f8_insert(s, x) }
+/// [`f8_insert!`], extract flavor: identical math through
+/// [`lookup8_extract!`] — same prescaled extraction, no stack round-trip.
+/// A macro for the same force-inline reason.
+macro_rules! f8_extract {
+    ($s:expr, $x:expr) => {{
+        let s = $s;
+        let x = $x;
+        let stride_mask = _mm256_set1_epi32(0x1fe0);
+        let a = _mm256_and_si256(_mm256_srli_epi32::<19>(x), stride_mask);
+        let b = _mm256_and_si256(_mm256_srli_epi32::<11>(x), stride_mask);
+        let c = _mm256_and_si256(_mm256_srli_epi32::<3>(x), stride_mask);
+        let d = _mm256_and_si256(_mm256_slli_epi32::<5>(x), stride_mask);
+        // Same argument as `f8_insert!` — prescaled byte offsets into
+        // real boxes, so the module-level lookup invariant holds at all
+        // four lookups; that is the contract `lookup8_extract!`'s
+        // internal unsafe blocks rely on.
+        let (va, vb, vc, vd) = (
+            lookup8_extract!(s.box_base(0), a),
+            lookup8_extract!(s.box_base(1), b),
+            lookup8_extract!(s.box_base(2), c),
+            lookup8_extract!(s.box_base(3), d),
+        );
+        _mm256_add_epi32(_mm256_xor_si256(_mm256_add_epi32(va, vb), vc), vd)
+    }};
+}
+
+/// The flavor-dispatched F, as a MACRO so the scalar-load flavors get
+/// textual inlining (see [`f8_insert!`]). `$flavor` is the caller's
+/// const generic (one of [`FLAVOR_GATHER`] / [`FLAVOR_INSERT`] /
+/// [`FLAVOR_EXTRACT`]), so the branch folds at monomorphization and no
+/// per-lookup branch exists in any kernel path.
+macro_rules! f8 {
+    ($flavor:ident, $s:expr, $x:expr) => {{
+        if $flavor == FLAVOR_GATHER {
+            f8_gather($s, $x)
+        } else if $flavor == FLAVOR_EXTRACT {
+            f8_extract!($s, $x)
+        } else {
+            f8_insert!($s, $x)
+        }
+    }};
 }
 
 /// The 16 Feistel rounds of one lockstep encryption, as a macro so every
@@ -224,13 +363,13 @@ fn f8<const GATHER: bool>(s: &SBoxes8, x: __m256i) -> __m256i {
 /// whitening lands on the exchanged registers and the final swap-undo is
 /// the one `mem::swap` after the pairs (register renaming; free).
 macro_rules! rounds16 {
-    ($state:expr, $gather:ident, $l:ident, $r:ident) => {{
+    ($state:expr, $flavor:ident, $l:ident, $r:ident) => {{
         macro_rules! pair {
             ($i:expr) => {{
                 $l = _mm256_xor_si256($l, $state.p[$i]);
-                $r = _mm256_xor_si256($r, f8::<$gather>(&$state.s, $l));
+                $r = _mm256_xor_si256($r, f8!($flavor, &$state.s, $l));
                 $r = _mm256_xor_si256($r, $state.p[$i + 1]);
-                $l = _mm256_xor_si256($l, f8::<$gather>(&$state.s, $r));
+                $l = _mm256_xor_si256($l, f8!($flavor, &$state.s, $r));
             }};
         }
         pair!(0);
@@ -252,12 +391,12 @@ macro_rules! rounds16 {
 /// P[16]/P[17] — identical control flow to scalar `encipher`.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn encipher8<const GATHER: bool>(
+fn encipher8<const FLAVOR: u8>(
     state: &State8,
     mut l: __m256i,
     mut r: __m256i,
 ) -> (__m256i, __m256i) {
-    rounds16!(state, GATHER, l, r);
+    rounds16!(state, FLAVOR, l, r);
     (l, r)
 }
 
@@ -272,7 +411,7 @@ fn encipher8<const GATHER: bool>(
 /// counter into the S loop.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn expand_state_v8<const GATHER: bool>(
+fn expand_state_v8<const FLAVOR: u8>(
     state: &mut State8,
     swv: &[__m256i; 4],
     kwv: &[__m256i; 18],
@@ -290,7 +429,7 @@ fn expand_state_v8<const GATHER: bool>(
         j += 1;
         r = _mm256_xor_si256(r, swv[j % 4]);
         j += 1;
-        rounds16!(state, GATHER, l, r);
+        rounds16!(state, FLAVOR, l, r);
         state.p[2 * pair] = l;
         state.p[2 * pair + 1] = r;
     }
@@ -300,7 +439,7 @@ fn expand_state_v8<const GATHER: bool>(
             j += 1;
             r = _mm256_xor_si256(r, swv[j % 4]);
             j += 1;
-            rounds16!(state, GATHER, l, r);
+            rounds16!(state, FLAVOR, l, r);
             let e = b * 256 + 2 * pair;
             // SAFETY: entries `e`/`e + 1` are 32-byte aligned by
             // construction (struct align 64, entry stride 32) and
@@ -318,16 +457,16 @@ fn expand_state_v8<const GATHER: bool>(
 /// [`expand_state_v8`] does, minus the salt mixing.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn encrypt_zero_chain_v8<const GATHER: bool>(state: &mut State8) {
+fn encrypt_zero_chain_v8<const FLAVOR: u8>(state: &mut State8) {
     let (mut l, mut r) = (_mm256_setzero_si256(), _mm256_setzero_si256());
     for pair in 0..9 {
-        rounds16!(state, GATHER, l, r);
+        rounds16!(state, FLAVOR, l, r);
         state.p[2 * pair] = l;
         state.p[2 * pair + 1] = r;
     }
     for b in 0..4 {
         for pair in 0..128 {
-            rounds16!(state, GATHER, l, r);
+            rounds16!(state, FLAVOR, l, r);
             let e = b * 256 + 2 * pair;
             // SAFETY: same argument as `expand_state_v8` — 32-byte aligned,
             // exclusively owned entries.
@@ -343,22 +482,22 @@ fn encrypt_zero_chain_v8<const GATHER: bool>(state: &mut State8) {
 /// then run the zero chain.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn expand0state_v8<const GATHER: bool>(state: &mut State8, wv: &[__m256i; 18]) {
+fn expand0state_v8<const FLAVOR: u8>(state: &mut State8, wv: &[__m256i; 18]) {
     for (p, &w) in state.p.iter_mut().zip(wv.iter()) {
         *p = _mm256_xor_si256(*p, w);
     }
-    encrypt_zero_chain_v8::<GATHER>(state);
+    encrypt_zero_chain_v8::<FLAVOR>(state);
 }
 
 /// Lockstep `Blowfish_expand0state(salt)`: the salt is exactly 4 words, so
 /// the P XOR cycles it (`i & 3`), then the same zero chain.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn expand0state_salt_v8<const GATHER: bool>(state: &mut State8, swv: &[__m256i; 4]) {
+fn expand0state_salt_v8<const FLAVOR: u8>(state: &mut State8, swv: &[__m256i; 4]) {
     for (i, p) in state.p.iter_mut().enumerate() {
         *p = _mm256_xor_si256(*p, swv[i & 3]);
     }
-    encrypt_zero_chain_v8::<GATHER>(state);
+    encrypt_zero_chain_v8::<FLAVOR>(state);
 }
 
 /// Transpose the eight lanes' key words into 18 vectors: vector `i` holds
@@ -425,7 +564,7 @@ fn transpose_salts(salt_words: &[[u32; 4]]) -> [__m256i; 4] {
 /// gathers index with byte-masked lanes only.
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn bcrypt8<const GATHER: bool>(
+unsafe fn bcrypt8<const FLAVOR: u8>(
     cost: u32,
     key_words: &[[u32; 18]],
     salt_words: &[[u32; 4]],
@@ -443,11 +582,11 @@ unsafe fn bcrypt8<const GATHER: bool>(
         p: [_mm256_setzero_si256(); 18],
         s: SBoxes8([[0; 8]; 1024]),
     };
-    expand_state_v8::<GATHER>(&mut state, &swv, &kwv);
+    expand_state_v8::<FLAVOR>(&mut state, &swv, &kwv);
     for _ in 0..(1u64 << cost) {
         // OpenBSD order: the password expansion first, the salt second.
-        expand0state_v8::<GATHER>(&mut state, &kwv);
-        expand0state_salt_v8::<GATHER>(&mut state, &swv);
+        expand0state_v8::<FLAVOR>(&mut state, &kwv);
+        expand0state_salt_v8::<FLAVOR>(&mut state, &swv);
     }
     // "OrpheanBeholderScryDoubt" as six broadcast words.
     let mut cdata = [
@@ -460,7 +599,7 @@ unsafe fn bcrypt8<const GATHER: bool>(
     ];
     for _ in 0..64 {
         for pair in 0..3 {
-            let (l, r) = encipher8::<GATHER>(&state, cdata[2 * pair], cdata[2 * pair + 1]);
+            let (l, r) = encipher8::<FLAVOR>(&state, cdata[2 * pair], cdata[2 * pair + 1]);
             cdata[2 * pair] = l;
             cdata[2 * pair + 1] = r;
         }
@@ -508,14 +647,17 @@ unsafe fn bcrypt8<const GATHER: bool>(
 enum Flavor {
     /// `_mm256_i32gather_epi32` (`vpgatherdd`).
     Gather,
-    /// Stack round-trip: store indices, eight scalar loads, load back.
+    /// Stack round-trip: store offsets, eight scalar loads, load back.
     Insert,
+    /// `vpextrd` lane → GPR → scalar load → `vpinsrd` rebuild.
+    Extract,
 }
 
 /// Sentinel meaning "the shootout has not run yet". Not a valid flavor.
 const FLAVOR_UNINIT: u8 = 0;
 const FLAVOR_GATHER: u8 = 1;
 const FLAVOR_INSERT: u8 = 2;
+const FLAVOR_EXTRACT: u8 = 3;
 
 /// Cached [`Flavor`] as a `u8`, or [`FLAVOR_UNINIT`].
 static CACHED_FLAVOR: AtomicU8 = AtomicU8::new(FLAVOR_UNINIT);
@@ -524,6 +666,7 @@ const fn flavor_to_u8(flavor: Flavor) -> u8 {
     match flavor {
         Flavor::Gather => FLAVOR_GATHER,
         Flavor::Insert => FLAVOR_INSERT,
+        Flavor::Extract => FLAVOR_EXTRACT,
     }
 }
 
@@ -532,6 +675,7 @@ const fn flavor_to_u8(flavor: Flavor) -> u8 {
 const fn flavor_from_u8(value: u8) -> Flavor {
     match value {
         FLAVOR_GATHER => Flavor::Gather,
+        FLAVOR_EXTRACT => Flavor::Extract,
         _ => Flavor::Insert,
     }
 }
@@ -540,7 +684,7 @@ const fn flavor_from_u8(value: u8) -> Flavor {
 /// Not a `OnceLock` for the same reason as `super::backend`: there is no
 /// data to publish, and a racing duplicate pick computes the same class of
 /// answer (a wrong pick costs a few percent, never correctness — the
-/// shootout asserts both flavors agree before timing anything).
+/// shootout asserts all flavors agree before timing anything).
 #[inline]
 fn flavor() -> Flavor {
     let cached = CACHED_FLAVOR.load(Ordering::Relaxed);
@@ -560,7 +704,7 @@ fn pick_and_cache() -> Flavor {
     picked
 }
 
-/// With a clock and optimized code: measure both flavors and keep the
+/// With a clock and optimized code: measure all flavors and keep the
 /// winner. In debug builds or under Miri, timing unoptimized/interpreted
 /// intrinsics measures the codegen mode, not the µarch — and without
 /// `std` there is no clock at all. All three take the minimax default
@@ -576,10 +720,10 @@ fn pick_flavor() -> Flavor {
     Flavor::Insert
 }
 
-/// The one-time gather-vs-insert shootout: both flavors hash the same
-/// fixed deterministic 8-password group at cost 4 — correctness first
+/// The one-time flavor shootout: all three flavors hash the same fixed
+/// deterministic 8-password group at cost 4 — correctness first
 /// (identical outputs; a mismatch is a kernel bug, not a tie), then three
-/// interleaved timed reps each, min per side, faster wins.
+/// interleaved timed reps each, min per side, fastest wins.
 #[cfg(all(feature = "std", not(debug_assertions), not(miri)))]
 fn shootout() -> Flavor {
     use std::time::Instant;
@@ -604,29 +748,43 @@ fn shootout() -> Flavor {
     // `bcrypt_lanes`, which the dispatch table hands out solely for
     // `Backend::Avx2` on CPUs advertising AVX2 (or the arch-gated tests,
     // which check `is_available` first); the slices are exactly 8 lanes.
-    unsafe { bcrypt8::<true>(4, &kws, &sws, &mut outs) };
+    unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
     let reference = outs;
-    unsafe { bcrypt8::<false>(4, &kws, &sws, &mut outs) };
+    unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
     assert_eq!(
         outs, reference,
         "avx2 flavor shootout: gather and insert kernels diverged — a kernel bug, not timing"
     );
-    let (mut best_gather, mut best_insert) = (f64::MAX, f64::MAX);
+    unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
+    assert_eq!(
+        outs, reference,
+        "avx2 flavor shootout: gather and extract kernels diverged — a kernel bug, not timing"
+    );
+    let (mut best_gather, mut best_insert, mut best_extract) = (f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..3 {
         let start = Instant::now();
-        unsafe { bcrypt8::<true>(4, &kws, &sws, &mut outs) };
+        unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
         best_gather = best_gather.min(start.elapsed().as_secs_f64());
         let start = Instant::now();
-        unsafe { bcrypt8::<false>(4, &kws, &sws, &mut outs) };
+        unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
         best_insert = best_insert.min(start.elapsed().as_secs_f64());
+        let start = Instant::now();
+        unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
+        best_extract = best_extract.min(start.elapsed().as_secs_f64());
         core::hint::black_box(&mut outs);
     }
-    if best_gather <= best_insert { Flavor::Gather } else { Flavor::Insert }
+    if best_gather <= best_insert && best_gather <= best_extract {
+        Flavor::Gather
+    } else if best_insert <= best_extract {
+        Flavor::Insert
+    } else {
+        Flavor::Extract
+    }
 }
 
 /// The flavor branch: resolved once per GROUP (one relaxed atomic load),
-/// then one of two fully monomorphized kernel paths — no per-lookup
-/// branch exists in either path.
+/// then one of three fully monomorphized kernel paths — no per-lookup
+/// branch exists in any path.
 ///
 /// # Safety
 ///
@@ -645,9 +803,11 @@ unsafe fn bcrypt_lanes_impl(
     debug_assert_eq!(outs.len(), LANES);
     match flavor() {
         // SAFETY: forwards this fn's contract unchanged.
-        Flavor::Gather => unsafe { bcrypt8::<true>(cost, key_words, salt_words, outs) },
+        Flavor::Gather => unsafe { bcrypt8::<FLAVOR_GATHER>(cost, key_words, salt_words, outs) },
         // SAFETY: forwards this fn's contract unchanged.
-        Flavor::Insert => unsafe { bcrypt8::<false>(cost, key_words, salt_words, outs) },
+        Flavor::Insert => unsafe { bcrypt8::<FLAVOR_INSERT>(cost, key_words, salt_words, outs) },
+        // SAFETY: forwards this fn's contract unchanged.
+        Flavor::Extract => unsafe { bcrypt8::<FLAVOR_EXTRACT>(cost, key_words, salt_words, outs) },
     }
 }
 
@@ -729,23 +889,26 @@ mod tests {
         (kws, sws)
     }
 
-    /// The gather-vs-insert correctness check: both flavors must produce
+    /// The flavor correctness check: all three flavors must produce
     /// byte-identical output on a fixed input. This is the test that pins
-    /// the `vpgatherdd` index math against the scalar-load spelling — the
-    /// shootout asserts the same invariant before it times anything.
+    /// the `vpgatherdd` index math against the scalar-load spellings —
+    /// the shootout asserts the same invariant before it times anything.
     #[test]
     fn flavors_agree() {
         if !avx2_available() {
             return;
         }
         let (kws, sws) = fixed_words();
-        let (mut gathered, mut inserted) = ([[0u8; 24]; LANES], [[0u8; 24]; LANES]);
+        let (mut gathered, mut inserted, mut extracted) =
+            ([[0u8; 24]; LANES], [[0u8; 24]; LANES], [[0u8; 24]; LANES]);
         // SAFETY: availability checked above; the slices are exactly 8 lanes.
         unsafe {
-            bcrypt8::<true>(4, &kws, &sws, &mut gathered);
-            bcrypt8::<false>(4, &kws, &sws, &mut inserted);
+            bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut gathered);
+            bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut inserted);
+            bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut extracted);
         }
         assert_eq!(gathered, inserted, "gather and insert flavors diverged");
+        assert_eq!(gathered, extracted, "gather and extract flavors diverged");
     }
 
     /// Eight different passwords and eight different salts, one per lane,
