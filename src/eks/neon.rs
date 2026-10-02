@@ -49,6 +49,15 @@
 //!   pressure stops the widening here — the loop runs at IPC ~8.2 of a
 //!   ~10-wide core, still issue-bound rather than load-bound (80 loads
 //!   per pair-iteration = 26.7c against a 42c measured pair time).
+//! * +1.2-2.0% — the 16 per-iteration P-row loads paired into 8-byte
+//!   loads feeding two lanes each (one `lsr` per pair, so the
+//!   instruction count is flat but the load count drops 92→82 in the
+//!   S-loop instance). Measured as a 10-pair interleaved A/B, batch 16
+//!   medians 3150 vs 3110 hashes/s. Nearby instruction-diet attempts
+//!   that all measured ≤0 or below the 1% bar and were reverted: full
+//!   unroll of the pair loop (−3%, half the spill traffic but a 2.9 KB
+//!   loop body), four mutually-opaque box base pointers (−4% of
+//!   instructions, −50% of spills, +0.1%), gather issue order (−0.8%).
 //!
 //! # Lookup invariant
 //!
@@ -173,8 +182,11 @@ unsafe fn f_word(s: &SBoxes, w: u32, lane: u32) -> u32 {
 /// in reference post-swap orientation, so the swap-undo is the one
 /// `mem::swap` per lane after the loop (register renaming; free).
 macro_rules! rounds16_scalar {
-    ($s:expr, $pw:expr, $(($l:ident, $r:ident, $lane:literal)),+ $(,)?) => {{
-        // One half-round for one lane: `x ^= P[i]`, `y ^= F(x)`. Each
+    ($s:expr, $pw:expr, $((($la:ident, $ra:ident), ($lb:ident, $rb:ident), $lp:literal)),+ $(,)?) => {{
+        // One half-round for two adjacent lanes: `x ^= P[i]`, `y ^= F(x)`.
+        // The P words of lanes `2*lp` and `2*lp+1` are adjacent in a P
+        // row, so one 8-byte load feeds both lanes' XOR (`from_le` keeps
+        // the lane order correct regardless of target endianness). Each
         // lane's state is a pair of named variables, not array elements,
         // so it is guaranteed register-resident. The `opaque` call cuts
         // the lanes' isomorphic instruction trees: without it LLVM's SLP
@@ -185,23 +197,34 @@ macro_rules! rounds16_scalar {
         // rustc 1.98 it lowers to a store+reload through a stack slot —
         // ~64 store→load forwards per encipher on the per-lane chains.
         // `opaque` is the same barrier, zero instructions.)
-        macro_rules! half {
-            ($x:ident, $y:ident, $i:expr, $ln:literal) => {{
-                $x ^= $pw[$i][$ln];
-                // SAFETY: `$ln < STRIDE`; the byte masks inside
+        macro_rules! half2 {
+            ($xa:ident, $ya:ident, $xb:ident, $yb:ident, $i:expr, $ln:literal) => {{
+                // SAFETY: reads 8 bytes inside row `$pw[$i]` (a `[u32;
+                // STRIDE]`, `STRIDE >= 2`), alignment handled by
+                // `read_unaligned`.
+                let p2 = unsafe { ($pw[$i].as_ptr().cast::<u64>()).add($ln).read_unaligned() };
+                let p2 = u64::from_le(p2);
+                $xa ^= p2 as u32;
+                $xb ^= (p2 >> 32) as u32;
+                // SAFETY: lane `2*$ln < STRIDE`; the byte masks inside
                 // `f_word` bound every index — the module-level lookup
                 // invariant.
-                $y ^= opaque(unsafe { f_word($s, $x, $ln) });
+                $ya ^= opaque(unsafe { f_word($s, $xa, 2 * $ln) });
+                // SAFETY: lane `2*$ln+1 < STRIDE`; same lookup invariant.
+                $yb ^= opaque(unsafe { f_word($s, $xb, 2 * $ln + 1) });
             }};
         }
         for pair in 0..8 {
-            $(half!($l, $r, 2 * pair, $lane);)+
-            $(half!($r, $l, 2 * pair + 1, $lane);)+
+            $(half2!($la, $ra, $lb, $rb, 2 * pair, $lp);)+
+            $(half2!($ra, $la, $rb, $lb, 2 * pair + 1, $lp);)+
         }
         $(
-            $l ^= $pw[16][$lane];
-            $r ^= $pw[17][$lane];
-            core::mem::swap(&mut $l, &mut $r);
+            $la ^= $pw[16][2 * $lp];
+            $lb ^= $pw[16][2 * $lp + 1];
+            $ra ^= $pw[17][2 * $lp];
+            $rb ^= $pw[17][2 * $lp + 1];
+            core::mem::swap(&mut $la, &mut $ra);
+            core::mem::swap(&mut $lb, &mut $rb);
         )+
     }};
 }
@@ -248,8 +271,8 @@ fn expand_state(state: &mut State, sw: &[[u32; STRIDE]; 4], kw: &[[u32; 18]; LAN
         j += 1;
         rounds16_scalar!(
             &state.s, &state.p,
-            (l0, r0, 0), (l1, r1, 1), (l2, r2, 2), (l3, r3, 3),
-            (l4, r4, 4), (l5, r5, 5), (l6, r6, 6), (l7, r7, 7),
+            ((l0, r0), (l1, r1), 0), ((l2, r2), (l3, r3), 1),
+            ((l4, r4), (l5, r5), 2), ((l6, r6), (l7, r7), 3),
         );
         state.p[2 * pair][..LANES].copy_from_slice(&[l0, l1, l2, l3, l4, l5, l6, l7]);
         state.p[2 * pair + 1][..LANES].copy_from_slice(&[r0, r1, r2, r3, r4, r5, r6, r7]);
@@ -276,8 +299,8 @@ fn expand_state(state: &mut State, sw: &[[u32; STRIDE]; 4], kw: &[[u32; 18]; LAN
             j += 1;
             rounds16_scalar!(
                 &state.s, &state.p,
-                (l0, r0, 0), (l1, r1, 1), (l2, r2, 2), (l3, r3, 3),
-                (l4, r4, 4), (l5, r5, 5), (l6, r6, 6), (l7, r7, 7),
+                ((l0, r0), (l1, r1), 0), ((l2, r2), (l3, r3), 1),
+                ((l4, r4), (l5, r5), 2), ((l6, r6), (l7, r7), 3),
             );
             let e = b * 256 + 2 * pair;
             state.s.0[e][..LANES].copy_from_slice(&[l0, l1, l2, l3, l4, l5, l6, l7]);
@@ -295,8 +318,8 @@ fn encrypt_zero_chain(state: &mut State) {
     for pair in 0..9 {
         rounds16_scalar!(
             &state.s, &state.p,
-            (l0, r0, 0), (l1, r1, 1), (l2, r2, 2), (l3, r3, 3),
-            (l4, r4, 4), (l5, r5, 5), (l6, r6, 6), (l7, r7, 7),
+            ((l0, r0), (l1, r1), 0), ((l2, r2), (l3, r3), 1),
+            ((l4, r4), (l5, r5), 2), ((l6, r6), (l7, r7), 3),
         );
         state.p[2 * pair][..LANES].copy_from_slice(&[l0, l1, l2, l3, l4, l5, l6, l7]);
         state.p[2 * pair + 1][..LANES].copy_from_slice(&[r0, r1, r2, r3, r4, r5, r6, r7]);
@@ -305,8 +328,8 @@ fn encrypt_zero_chain(state: &mut State) {
         for pair in 0..128 {
             rounds16_scalar!(
                 &state.s, &state.p,
-                (l0, r0, 0), (l1, r1, 1), (l2, r2, 2), (l3, r3, 3),
-                (l4, r4, 4), (l5, r5, 5), (l6, r6, 6), (l7, r7, 7),
+                ((l0, r0), (l1, r1), 0), ((l2, r2), (l3, r3), 1),
+                ((l4, r4), (l5, r5), 2), ((l6, r6), (l7, r7), 3),
             );
             let e = b * 256 + 2 * pair;
             state.s.0[e][..LANES].copy_from_slice(&[l0, l1, l2, l3, l4, l5, l6, l7]);
@@ -419,8 +442,8 @@ unsafe fn bcrypt_lanes_impl(
             );
             rounds16_scalar!(
                 &state.s, &state.p,
-                (l0, r0, 0), (l1, r1, 1), (l2, r2, 2), (l3, r3, 3),
-                (l4, r4, 4), (l5, r5, 5), (l6, r6, 6), (l7, r7, 7),
+                ((l0, r0), (l1, r1), 0), ((l2, r2), (l3, r3), 1),
+                ((l4, r4), (l5, r5), 2), ((l6, r6), (l7, r7), 3),
             );
             cdata[2 * pair][..LANES].copy_from_slice(&[l0, l1, l2, l3, l4, l5, l6, l7]);
             cdata[2 * pair + 1][..LANES].copy_from_slice(&[r0, r1, r2, r3, r4, r5, r6, r7]);
