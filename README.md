@@ -98,7 +98,18 @@ the pattern real callers use today.
 | batch 16, cost 12 | 3.69 h/s | 7.27 h/s | **1.97×** |
 | verify, cost 4 | 977 µs | 998 µs | 0.98× |
 
-### `parallel` feature (batch 64, Zen 4, 4 vCPU, cost 5)
+### `parallel` feature (batch 64, cost 5)
+
+**Apple M5 Max** (18 cores, medians of 4 runs):
+
+| configuration | hashes/s | vs 1-core scalar |
+|---|---|---|
+| scalar | 768.7 | 1.00 |
+| NEON | 2966.4 | 3.86× |
+| scalar + `parallel` | 7402.2 | 9.63× |
+| NEON + `parallel` | 15543.4 | **20.22×** |
+
+**AMD EPYC Zen 4** (4 vCPU):
 
 | configuration | hashes/s | vs 1-core scalar |
 |---|---|---|
@@ -109,7 +120,10 @@ the pattern real callers use today.
 
 Chunks are lane-group-aligned, so on AVX-512 the parallel split engages only
 when each worker gets at least one full 16-lane group (`items ≥ cores × 16`);
-a batch of 16 on 4 cores stays single-worker by design.
+a batch of 16 on 4 cores stays single-worker by design. John the Ripper's
+bcrypt data shows SMT siblings add +20–40% for this latency-bound loop, and
+`available_parallelism` counts logical CPUs, so on SMT hosts the split
+already engages siblings.
 
 ### Per-backend verification status
 
