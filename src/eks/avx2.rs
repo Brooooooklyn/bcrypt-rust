@@ -748,14 +748,20 @@ fn shootout() -> Flavor {
     // `bcrypt_lanes`, which the dispatch table hands out solely for
     // `Backend::Avx2` on CPUs advertising AVX2 (or the arch-gated tests,
     // which check `is_available` first); the slices are exactly 8 lanes.
-    unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
+    // SAFETY: per the fn-level comment above — dispatch hands this fn out
+        // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+        unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
     let reference = outs;
-    unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
+    // SAFETY: per the fn-level comment above — dispatch hands this fn out
+        // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+        unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
     assert_eq!(
         outs, reference,
         "avx2 flavor shootout: gather and insert kernels diverged — a kernel bug, not timing"
     );
-    unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
+    // SAFETY: per the fn-level comment above — dispatch hands this fn out
+        // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+        unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
     assert_eq!(
         outs, reference,
         "avx2 flavor shootout: gather and extract kernels diverged — a kernel bug, not timing"
@@ -763,13 +769,19 @@ fn shootout() -> Flavor {
     let (mut best_gather, mut best_insert, mut best_extract) = (f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..3 {
         let start = Instant::now();
-        unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
+        // SAFETY: per the fn-level comment above — dispatch hands this fn out
+                // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+            unsafe { bcrypt8::<FLAVOR_GATHER>(4, &kws, &sws, &mut outs) };
         best_gather = best_gather.min(start.elapsed().as_secs_f64());
         let start = Instant::now();
-        unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
+        // SAFETY: per the fn-level comment above — dispatch hands this fn out
+                // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+            unsafe { bcrypt8::<FLAVOR_INSERT>(4, &kws, &sws, &mut outs) };
         best_insert = best_insert.min(start.elapsed().as_secs_f64());
         let start = Instant::now();
-        unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
+        // SAFETY: per the fn-level comment above — dispatch hands this fn out
+                // only for AVX2-capable CPUs; the slices are exactly 8 lanes.
+            unsafe { bcrypt8::<FLAVOR_EXTRACT>(4, &kws, &sws, &mut outs) };
         best_extract = best_extract.min(start.elapsed().as_secs_f64());
         core::hint::black_box(&mut outs);
     }
