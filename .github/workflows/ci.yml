@@ -285,6 +285,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --benches --features internal-api
 
+  # Codegen drift net: disassembles the release objects and fails on the
+  # three historical silent regressions — vpgatherdd re-formed inside the
+  # avx2/avx512 insert/extract flavor bodies (lane_load! defeated),
+  # outlined F()-helper calls inside the rounds regions (rust#145574), and
+  # NEON rounds inflation from black_box store->load round-trips. Static
+  # inspection, so no CPU features are needed and there is no runner
+  # lottery. The script rustup-adds llvm-tools and, on macOS, the
+  # x86_64-apple-darwin target itself (rlib: no link step), so the macOS
+  # leg inspects BOTH arches' objects; the ubuntu leg re-inspects x86_64
+  # in the ELF object format.
+  codegen:
+    name: codegen (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64 + x86_64, macOS
+            os: macos-latest
+            leg: all
+          - name: x86_64, linux
+            os: ubuntu-latest
+            leg: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash ci/codegen-check.sh ${{ matrix.leg }}
+
   # The SIMD paths are platform-independent in behaviour (cross-backend
   # equality-verified), so the sanitizer-style jobs run on both arches:
   # x86_64-linux covers the SSE4.1/AVX2(/AVX-512) builds, aarch64-mac covers
@@ -385,6 +414,7 @@ jobs:
       - old-glibc
       - wasm
       - benches-compile
+      - codegen
       - miri
       - asan
       - fuzz
