@@ -37,7 +37,7 @@
 //!   call. A group is `lanes` full bcrypt hashes — expensive at any realistic
 //!   cost — so dispatch overhead is nil.
 //!
-//! # The x86-64 width shootout (AVX2 vs AVX-512)
+//! # The x86-64 width shootout (AVX2 vs AVX-512, AVX2x12 where it fits)
 //!
 //! Wider is not automatically faster for bcrypt. Every lane carries a 4 KiB
 //! mutable S-box working set, so the 16-lane AVX-512 kernel's struct-of-
@@ -51,17 +51,26 @@
 //! Zen 5 and Turin Dense all differ again — so [`detect`] settles it by
 //! *measurement*: with `std`, optimized code and no Miri, a CPU advertising
 //! both AVX2 and AVX-512F runs a one-time width shootout — the same fixed
-//! 32-password batch at cost 4 through both backends' normal kernels (which
-//! also settles each backend's own flavor shootout), outputs asserted
-//! byte-identical before anything is timed (a mismatch is a kernel bug, not
-//! a tie), three interleaved timed reps each, min wins. The winner is cached
-//! in `CACHED_WIDTH`; a tie keeps the static order. The one-time cost is
-//! measured, not theoretical: ~0.4 s on the shared 4-vCPU Zen 4 sandbox
-//! (a cost-4 hash there is ~0.55 ms, and the batch is hashed eight times per
-//! side — once for the assert, three times for the clock — plus each
-//! backend's own flavor shootout; the winner's would be paid by the first
-//! batch call anyway). Debug, `no_std` and Miri builds never time anything —
-//! they keep the static `Avx512`-first order.
+//! 48-password batch at cost 4 through the candidate backends' normal
+//! kernels (which also settles each backend's own flavor shootout), outputs
+//! asserted byte-identical across ALL arms before anything is timed (a
+//! mismatch is a kernel bug, not a tie), three interleaved timed reps each,
+//! min wins. The winner is cached in `CACHED_WIDTH`; a tie keeps the static
+//! order. The one-time cost is measured, not theoretical: ~0.4 s on the
+//! shared 4-vCPU Zen 4 sandbox (a cost-4 hash there is ~0.55 ms, and the
+//! batch is hashed four times per arm — once for the assert, three for the
+//! clock — plus each backend's own flavor shootout; the winner's would be
+//! paid by the first batch call anyway). Debug, `no_std` and Miri builds
+//! never time anything — they keep the static `Avx512`-first order.
+//!
+//! A third arm joins the shootout only where the cache geometry allows:
+//! [`Backend::Avx2x12`], twelve AVX2 lanes (eight ymm + four xmm) whose
+//! 48 KiB working set is exactly the L1d of Zen 5, Ice Lake and later Intel
+//! cores. [`l1d_size`] probes cpuid leaf 4 and admits the arm at ≥ 48 KiB;
+//! the AVX-512F gate above costs nothing because every 48 KiB-L1d x86 chip
+//! also ships AVX-512. The arm is picked only on a strict timed win — ties
+//! keep the wider incumbent (`avx512 > avx2 > avx2x12`) — and the 12-lane
+//! kernel is never in the static fallback order.
 //!
 //! # `no_std`
 //!
@@ -92,6 +101,9 @@ pub mod neon;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
+
+#[cfg(target_arch = "x86_64")]
+pub mod avx2x12;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx512;
@@ -135,6 +147,12 @@ pub enum Backend {
     /// wasm32 fixed-width SIMD128, 8 lanes as two interleaved 4-lane
     /// `v128` states (X2). Compile-time selected.
     Wasm128 = 5,
+    /// x86-64 AVX2, 12 lanes as one 8-lane ymm group plus one 4-lane xmm
+    /// group in lockstep (48 KiB SoA working set, insert/extract lookup
+    /// flavours only — no gather). Never in the static fallback order:
+    /// reachable only through the measured width shootout on hosts whose
+    /// L1d is at least 48 KiB (Zen 5, Ice Lake+), or by explicit force.
+    Avx2x12 = 6,
 }
 
 /// The signature every backend's batch kernel has.
@@ -160,6 +178,7 @@ impl Backend {
         Backend::Neon,
         Backend::Sse41,
         Backend::Avx2,
+        Backend::Avx2x12,
         Backend::Avx512,
         Backend::Wasm128,
     ];
@@ -175,6 +194,7 @@ impl Backend {
             Backend::Avx2 => "avx2",
             Backend::Avx512 => "avx512",
             Backend::Wasm128 => "wasm128",
+            Backend::Avx2x12 => "avx2_12",
         }
     }
 
@@ -188,6 +208,7 @@ impl Backend {
             Backend::Sse41 => 4,
             Backend::Avx2 => 8,
             Backend::Avx512 => 16,
+            Backend::Avx2x12 => 12,
             // The kernel's lane count lives next to the kernel; the
             // module only exists on simd128-enabled wasm32, so off-arch
             // builds keep the constant inline (the backend is never
@@ -212,6 +233,11 @@ impl Backend {
             Backend::Sse41 => have_sse41(),
             Backend::Avx2 => have_avx2(),
             Backend::Avx512 => have_avx512f(),
+            // The kernel is plain AVX2 code: any AVX2 CPU executes it
+            // correctly. The 48 KiB-L1d gate is a *selection* rule (the
+            // width shootout), not an availability rule — a forced
+            // `BCRYPT_REQUIRE_BACKEND=avx2_12` must run anywhere AVX2 does.
+            Backend::Avx2x12 => have_avx2(),
             Backend::Wasm128 => have_wasm_simd128(),
         }
     }
@@ -231,6 +257,7 @@ impl Backend {
             3 => Backend::Avx2,
             4 => Backend::Avx512,
             5 => Backend::Wasm128,
+            6 => Backend::Avx2x12,
             _ => Backend::Scalar,
         }
     }
@@ -339,7 +366,8 @@ static CACHED_BACKEND: AtomicU8 = AtomicU8::new(UNINIT);
 /// `Wasm128` on simd128-enabled wasm32, `Scalar` everywhere else. The probes
 /// are arch-gated, so the single cascade below cannot pick an off-arch backend.
 /// The one exception to the static order is the module-level width shootout:
-/// where it applies it can demote `Avx512` to `Avx2` — by measurement.
+/// where it applies it can demote `Avx512` to `Avx2` — or, on hosts whose
+/// L1d is at least 48 KiB, to `Avx2x12` — by measurement.
 ///
 /// The cascade itself always re-runs (a few `cpuid` reads, each cached by the
 /// standard library); the one expensive decision — the width shootout, when
@@ -398,20 +426,59 @@ pub fn backend() -> Backend {
 }
 
 // ---------------------------------------------------------------------------
-// Width shootout: AVX2 vs AVX-512 (x86-64, std, optimized, non-Miri only)
+// Width shootout: AVX2 vs AVX-512 vs AVX2x12 (x86-64, std, optimized,
+// non-Miri only)
 // ---------------------------------------------------------------------------
 
 /// Cached width-shootout winner as a `u8`, or [`UNINIT`] — the same sentinel
-/// protocol as [`CACHED_BACKEND`]. Only ever holds [`Backend::Avx2`] or
-/// [`Backend::Avx512`]; single-assignment (see [`width_shootout_and_cache`]).
+/// protocol as [`CACHED_BACKEND`]. Only ever holds [`Backend::Avx2`],
+/// [`Backend::Avx512`] or [`Backend::Avx2x12`]; single-assignment (see
+/// [`width_shootout_and_cache`]).
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
 static CACHED_WIDTH: AtomicU8 = AtomicU8::new(UNINIT);
+
+/// The L1 data cache size in bytes from cpuid leaf 4 (Deterministic Cache
+/// Parameters), or `None` when the leaf describes no L1 data cache. Only
+/// the width shootout asks: [`Backend::Avx2x12`] joins the arm list exactly
+/// when the answer is at least 48 KiB — the L1d of Zen 5, Ice Lake and
+/// later Intel cores, and exactly the 12-lane kernel's working set.
+#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+fn l1d_size() -> Option<usize> {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // Leaf 4 exists on every CPU the shootout can run on (AVX-512F is
+    // decades newer), but a hypervisor could mask it — probe defensively.
+    if __cpuid(0).eax < 4 {
+        return None;
+    }
+    // Sub-leaves enumerate the cache hierarchy; type 0 ends the list. The
+    // 16-iteration cap is paranoia against a broken cpuid, never hit in
+    // practice (real hierarchies have ≤ 4 entries).
+    for sub_leaf in 0..16u32 {
+        let r = __cpuid_count(4, sub_leaf);
+        let cache_type = r.eax & 0x1f;
+        if cache_type == 0 {
+            break;
+        }
+        // Type 1 = data cache, level field 1 = L1.
+        if cache_type == 1 && (r.eax >> 5) & 0x7 == 1 {
+            let line_size = (r.ebx & 0xfff) as usize + 1;
+            let partitions = ((r.ebx >> 12) & 0x3ff) as usize + 1;
+            let ways = ((r.ebx >> 22) & 0x3ff) as usize + 1;
+            let sets = r.ecx as usize + 1;
+            return Some(line_size * partitions * ways * sets);
+        }
+    }
+    None
+}
 
 /// The answer to "AVX-512F advertised": which width actually wins on *this*
 /// CPU. With a clock and optimized code a one-time shootout decides (module
 /// docs); it needs AVX2 as the alternative, and without it the static order
 /// stands. Reached only from [`detect`]'s `have_avx512f()` arm, so AVX-512F
-/// is known available here.
+/// is known available here — which is also why the shootout's
+/// [`Backend::Avx2x12`] arm needs no AVX-512 probe of its own: every
+/// 48 KiB-L1d x86 chip advertises AVX-512F, so the arm's absence on
+/// AVX2-only hosts costs nothing.
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
 fn width_pick() -> Backend {
     if !have_avx2() {
@@ -450,13 +517,19 @@ fn width_shootout_and_cache() -> Backend {
     }
 }
 
-/// The one-time width shootout: both x86-64 SIMD backends hash the same fixed
-/// deterministic 32-password batch at cost 4 — correctness first
-/// (byte-identical outputs; a mismatch is a kernel bug, not a tie), then
-/// three interleaved timed reps each, min per side, faster wins. A tie keeps
-/// the static order (AVX-512). The batch is 32 items — four AVX2 groups /
-/// two AVX-512 groups, a multiple of both lane counts, so no padded tail
-/// distorts either side and both backends hash the same 32 passwords, making
+/// The one-time width shootout: the candidate x86-64 SIMD backends hash the
+/// same fixed deterministic 48-password batch at cost 4 — correctness first
+/// (outputs asserted byte-identical across ALL arms; a mismatch is a kernel
+/// bug, not a tie), then three interleaved timed reps each, min per arm.
+/// The arm list is `Avx512` and `Avx2` always, plus [`Backend::Avx2x12`]
+/// where [`l1d_size`] reports at least 48 KiB (its kernel is AVX2 code,
+/// which `width_pick` already proved present). Arms are in tie-preference
+/// order — `avx512 > avx2 > avx2x12` — and an arm must be STRICTLY faster
+/// than the reigning arm to take the title, so a tie keeps the wider
+/// incumbent and the 12-lane kernel is picked only on an outright win. The
+/// batch is 48 items — six AVX2 groups / three AVX-512 groups / four
+/// AVX2x12 groups, the lcm of the arm lane counts — so no padded tail
+/// distorts any side and every arm hashes the same 48 passwords, making
 /// raw elapsed time a per-hash comparison.
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
 fn width_shootout() -> Backend {
@@ -472,7 +545,7 @@ fn width_shootout() -> Backend {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         (z ^ (z >> 31)) as u32
     };
-    const ITEMS: usize = 32;
+    const ITEMS: usize = 48;
     let mut kws = [[0u32; 18]; ITEMS];
     let mut sws = [[0u32; 4]; ITEMS];
     for w in kws.as_flattened_mut().iter_mut().chain(sws.as_flattened_mut()) {
@@ -490,11 +563,12 @@ fn width_shootout() -> Backend {
     ) {
         let mut base = 0;
         while base < ITEMS {
-            // SAFETY: `width_shootout` runs only when both AVX2 and AVX-512F
-            // are advertised (`width_pick`'s gate), so both kernels target
-            // this CPU's instruction set. `ITEMS` is a multiple of both lane
-            // counts, so every group slice is exactly `lanes` long, and each
-            // `outs` group is exclusively owned by this frame.
+            // SAFETY: `width_shootout` runs only when AVX2 and AVX-512F
+            // are both advertised (`width_pick`'s gate), and every arm's
+            // kernel targets one of those instruction sets (the AVX2x12
+            // kernel is AVX2 code). `ITEMS` is a multiple of every arm's
+            // lane count, so each group slice is exactly `lanes` long,
+            // and each `outs` group is exclusively owned by this frame.
             unsafe {
                 kernel(
                     4,
@@ -507,35 +581,53 @@ fn width_shootout() -> Backend {
         }
     }
 
-    let avx2 = bcrypt_lanes_fn(Backend::Avx2);
-    let avx512 = bcrypt_lanes_fn(Backend::Avx512);
-    let mut outs_avx2 = [[0u8; 24]; ITEMS];
-    let mut outs_avx512 = [[0u8; 24]; ITEMS];
-    // Correctness before timing: these first calls also run each backend's
-    // own flavor shootout, so both kernels are fully warmed before the clock
-    // starts.
-    run_batch(avx2, Backend::Avx2.lanes(), &kws, &sws, &mut outs_avx2);
-    run_batch(avx512, Backend::Avx512.lanes(), &kws, &sws, &mut outs_avx512);
-    assert_eq!(
-        outs_avx2, outs_avx512,
-        "width shootout: avx2 and avx512 kernels diverged — a kernel bug, not timing"
-    );
-    let (mut best_avx2, mut best_avx512) = (f64::MAX, f64::MAX);
-    for _ in 0..3 {
-        let start = Instant::now();
-        run_batch(avx2, Backend::Avx2.lanes(), &kws, &sws, &mut outs_avx2);
-        best_avx2 = best_avx2.min(start.elapsed().as_secs_f64());
-        let start = Instant::now();
-        run_batch(avx512, Backend::Avx512.lanes(), &kws, &sws, &mut outs_avx512);
-        best_avx512 = best_avx512.min(start.elapsed().as_secs_f64());
-        core::hint::black_box(&mut outs_avx2);
-        core::hint::black_box(&mut outs_avx512);
-    }
-    if best_avx2 < best_avx512 {
-        Backend::Avx2
+    // The arm list, in tie-preference order. The 12-lane arm exists only
+    // where its 48 KiB working set fits the L1d it must live in (module
+    // docs); resolving its function pointer when ineligible is harmless.
+    let arms: [(Backend, BcryptLanesFn); 3] = [
+        (Backend::Avx512, bcrypt_lanes_fn(Backend::Avx512)),
+        (Backend::Avx2, bcrypt_lanes_fn(Backend::Avx2)),
+        (Backend::Avx2x12, bcrypt_lanes_fn(Backend::Avx2x12)),
+    ];
+    let arms = &arms[..if l1d_size().is_some_and(|bytes| bytes >= 48 * 1024) {
+        3
     } else {
-        Backend::Avx512
+        2
+    }];
+
+    let mut outs = [[[0u8; 24]; ITEMS]; 3];
+    // Correctness before timing: these first calls also run each arm's own
+    // flavor shootout, so all kernels are fully warmed before the clock
+    // starts.
+    for (i, &(backend, kernel)) in arms.iter().enumerate() {
+        run_batch(kernel, backend.lanes(), &kws, &sws, &mut outs[i]);
+        assert_eq!(
+            outs[i], outs[0],
+            "width shootout: {} and {} kernels diverged — a kernel bug, not timing",
+            backend.name(),
+            arms[0].0.name(),
+        );
     }
+    let mut best = [f64::MAX; 3];
+    for _ in 0..3 {
+        for (i, &(backend, kernel)) in arms.iter().enumerate() {
+            let start = Instant::now();
+            run_batch(kernel, backend.lanes(), &kws, &sws, &mut outs[i]);
+            best[i] = best[i].min(start.elapsed().as_secs_f64());
+            core::hint::black_box(&mut outs[i]);
+        }
+    }
+    // An arm takes the title only by being strictly faster than the
+    // reigning arm; arms are in tie-preference order, so ties keep the
+    // wider incumbent.
+    let (mut pick, mut pick_best) = (arms[0].0, best[0]);
+    for (i, &(backend, _)) in arms.iter().enumerate().skip(1) {
+        if best[i] < pick_best {
+            pick = backend;
+            pick_best = best[i];
+        }
+    }
+    pick
 }
 
 /// The `bcrypt_lanes` implementation for `backend`.
@@ -569,6 +661,10 @@ pub fn bcrypt_lanes_fn(backend: Backend) -> BcryptLanesFn {
         Backend::Avx512 => avx512::bcrypt_lanes,
         #[cfg(not(target_arch = "x86_64"))]
         Backend::Avx512 => scalar::bcrypt_lanes,
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2x12 => avx2x12::bcrypt_lanes,
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Avx2x12 => scalar::bcrypt_lanes,
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         Backend::Wasm128 => wasm128::bcrypt_lanes,
         #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
@@ -636,8 +732,8 @@ mod tests {
         assert_ne!(CACHED_BACKEND.load(Ordering::Relaxed), UNINIT);
     }
 
-    /// Where both x86-64 SIMD backends exist, detection's pick is one of the
-    /// two and stable across calls — the width shootout's winner is cached.
+    /// Where both x86-64 SIMD backends exist, detection's pick is one of
+    /// the shootout's arms and stable across calls — the winner is cached.
     /// Hosts without both widths (including Miri, which pins Scalar, and
     /// Rosetta, which lacks AVX-512) have no pick to make: skip.
     #[test]
@@ -646,7 +742,10 @@ mod tests {
             return;
         }
         let first = detect();
-        assert!(matches!(first, Backend::Avx2 | Backend::Avx512));
+        assert!(matches!(
+            first,
+            Backend::Avx2 | Backend::Avx512 | Backend::Avx2x12
+        ));
         // Second call reads the cached pick: same answer, and where the
         // shootout is compiled in at all its cache is populated.
         assert_eq!(detect(), first);
@@ -677,7 +776,11 @@ mod tests {
             assert!(!have_neon());
             assert!(matches!(
                 detect(),
-                Backend::Sse41 | Backend::Avx2 | Backend::Avx512 | Backend::Scalar
+                Backend::Sse41
+                    | Backend::Avx2
+                    | Backend::Avx512
+                    | Backend::Avx2x12
+                    | Backend::Scalar
             ));
         }
         if cfg!(target_arch = "wasm32") {
