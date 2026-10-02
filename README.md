@@ -34,26 +34,38 @@ aborts instead of posting a fast-but-wrong number).
 
 | backend | lanes | batch | hashes/s | vs scalar |
 |---|---|---|---|---|
-| scalar | 1 | 16 | 811.6 | 1.00 |
-| NEON | 4 | 16 | 2252.8 | **2.78×** |
-| NEON | 4 | 4 | 2248.3 | 2.82× |
-| wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
+| scalar | 1 | 16 | 835.4 | 1.00 |
+| NEON | 8 | 8 | 3174.7 | **3.90×** |
+| NEON | 8 | 16 | 3193.8 | 3.82× |
+| NEON | 8 | 32 | 3190.7 | 3.80× |
+| wasm128 (under wasmtime 48, cost 4) | 8 | 8 | 2006.8 | 1.56× |
+
+The NEON backend is an 8-lane scalar-GPR interleave (John the Ripper's
+design: vector registers appear only at pack/unpack; the name is
+historical). It replaced a 4-lane vector kernel after measurement
+(2.78× → 3.82×). The wasm128 backend likewise runs two interleaved
+4-lane states (1.21× → 1.56×).
 
 **AMD EPYC Zen 4** (x86_64, Cloudflare sandbox, 4 vCPU), rustc 1.99.0, cost 5,
-batch 16:
+batch 16 (ranges span the ±10% drift between sandbox windows):
 
 | backend | lanes | hashes/s | vs scalar |
 |---|---|---|---|
-| scalar | 1 | 564.2 | 1.00 |
-| SSE4.1 | 4 | 632.7 | 1.12× |
-| AVX2 | 8 | 869.7 | **1.54×** |
-| AVX-512 | 16 | 798.5 | 1.42× |
+| scalar | 1 | 568.8 | 1.00 |
+| SSE4.1 | 4 | 631.4 | 1.11× |
+| AVX2 | 8 | 896.8–950.2 | **1.58–1.67×** |
+| AVX-512 | 16 | 883.9–932.5 | 1.55–1.64× |
 
-AVX-512 loses to AVX2 on Zen 4: its SoA S-boxes are 64 KiB (vs AVX2's 32 KiB,
-exactly L1d-sized) and Zen 4 double-pumps 512-bit ops anyway. On Intel cores
-with native 512-bit units (Sapphire Rapids) the wide kernel pulls ahead
-instead, so runtime dispatch picks between the two by measurement — a
-one-time width shootout; see "Dispatch notes" below.
+AVX2 and AVX-512 sit at parity on Zen 4 (the width shootout picked AVX2 in
+this window): AVX-512's SoA S-boxes are 64 KiB against Zen 4's 32 KiB L1d,
+and Zen 4 double-pumps 512-bit ops anyway. On Sapphire Rapids — the one
+µarch with a fast zmm gather (6 cycles) — the wide kernel pulls ahead, so
+runtime dispatch answers the width question by measurement (one-time
+shootout; see "Dispatch notes"). Both x86-64 backends also shoot out three
+S-box lookup flavors (gather/insert/extract) per process the same way;
+prescaled byte offsets plus an opaque-asm blocker that stops LLVM from
+re-forming microcoded gathers took the AVX-512 path from 383 h/s to
+parity.
 
 Single-hash latency, cost 4: **646 µs** (criterion, M5 Max). Throughput
 scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
@@ -71,28 +83,29 @@ the pattern real callers use today.
 |---|---|---|---|
 | single hash, cost 4 | 741 µs | 662 µs | 1.12× |
 | single hash, cost 12 | 174.7 ms | 161.2 ms | 1.08× |
-| batch 16, cost 4 | 1411 h/s | 4249 h/s | **3.01×** |
-| batch 16, cost 12 | 5.64 h/s | 17.62 h/s | **3.12×** |
+| batch 16, cost 4 | 1429 h/s | 6134 h/s | **4.29×** |
+| batch 16, cost 12 | 5.79 h/s | 25.30 h/s | **4.37×** |
 | verify, cost 4 | 718 µs | 666 µs | 1.08× |
 
-**AMD EPYC Zen 4, 4 vCPU:**
+**AMD EPYC Zen 4, 4 vCPU** (batch arms re-measured after the x86 work;
+±10% sandbox drift applies):
 
 | workload | `bcrypt` | `bcrypt-rust` | speedup |
 |---|---|---|---|
 | single hash, cost 4 | 972 µs | 899 µs | 1.08× |
 | single hash, cost 12 | 239.4 ms | 240.2 ms | 1.00× |
-| batch 16, cost 4 | 905 h/s | 1519 h/s | **1.68×** |
-| batch 16, cost 12 | 4.20 h/s | 6.38 h/s | **1.52×** |
+| batch 16, cost 4 | 897 h/s | 1737 h/s | **1.94×** |
+| batch 16, cost 12 | 3.69 h/s | 7.27 h/s | **1.97×** |
 | verify, cost 4 | 977 µs | 998 µs | 0.98× |
 
 ### `parallel` feature (batch 64, Zen 4, 4 vCPU, cost 5)
 
 | configuration | hashes/s | vs 1-core scalar |
 |---|---|---|
-| scalar | 520.9 | 1.00 |
-| AVX2 | 794.5 | 1.53× |
-| scalar + `parallel` | 1983.9 | 3.81× |
-| AVX2 + `parallel` | 2813.4 | **5.40×** |
+| scalar | 565.5 | 1.00 |
+| AVX2 | 910.6 | 1.61× |
+| scalar + `parallel` | 1896.0 | 3.35× |
+| AVX2 + `parallel` | 2753.2 | **4.87×** |
 
 Chunks are lane-group-aligned, so on AVX-512 the parallel split engages only
 when each worker gets at least one full 16-lane group (`items ≥ cores × 16`);
@@ -103,11 +116,11 @@ a batch of 16 on 4 cores stays single-worker by design.
 | backend | lanes | targets | execution evidence |
 |---|---|---|---|
 | scalar | 1 | all | everywhere; the reference every other backend is checked against |
-| NEON | 4 | aarch64 | native: full suite + the measurements above (M5 Max) |
+| NEON | 8 | aarch64 | native: full suite + the measurements above (M5 Max) |
 | SSE4.1 | 4 | x86, x86_64 | full suite under Rosetta 2 **and** under QEMU TCG (Debian 12, real cpuid) |
-| AVX2 | 8 | x86_64 | full suite under Rosetta 2 (`+avx2`) and QEMU TCG; the gather-vs-insert shootout asserts both lookup flavors byte-identical before timing |
+| AVX2 | 8 | x86_64 | full suite under Rosetta 2 (`+avx2`) and QEMU TCG; the gather/insert/extract shootout asserts all three lookup flavors byte-identical before timing |
 | AVX-512 | 16 | x86_64 | full suite on real Zen 4 hardware (Cloudflare sandbox) with `BCRYPT_REQUIRE_BACKEND=avx512` — byte-exact vs scalar, every other backend, and crypt_blowfish C; CI **requires** it on any runner advertising `avx512f` (macOS cannot execute it locally: Rosetta SIGILLs, QEMU TCG has no AVX-512 emulation) |
-| wasm128 | 4 | wasm32 | full suite + micro bench under wasmtime (`+simd128`), scalar-fallback leg without it |
+| wasm128 | 8 | wasm32 | full suite + micro bench under wasmtime (`+simd128`), scalar-fallback leg without it |
 
 ### Dispatch notes
 
@@ -156,7 +169,7 @@ bcrypt_many / hash_many / hash_many_with_salts / verify_many
  (std builds)    (no_std / miri)                (fallback)
       │
       ▼
- avx512 ×16 ─ avx2 ×8 ─ sse41 ×4 ─ neon ×4 ─ wasm128 ×4 ─ scalar ×1
+ avx512 ×16 ─ avx2 ×8 ─ sse41 ×4 ─ neon ×8 ─ wasm128 ×8 ─ scalar ×1
       │
       ▼
  batch split into lane groups; short groups padded, padding discarded

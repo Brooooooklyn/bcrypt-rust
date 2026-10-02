@@ -22,16 +22,15 @@
 //!
 //! | backend | lanes | batch | hashes/s | vs scalar |
 //! |---|---|---|---|---|
-//! | scalar | 1 | 16 | 811.6 | 1.00 |
-//! | NEON | 4 | 16 | 2252.8 | 2.78× |
-//! | NEON | 4 | 4 | 2248.3 | 2.82× |
-//! | wasm128 (under wasmtime 48) | 4 | 8 | 1522.3 | 1.21× |
+//! | scalar | 1 | 16 | 835.4 | 1.00 |
+//! | NEON | 8 | 16 | 3193.8 | 3.82× |
+//! | wasm128 (under wasmtime 48, cost 4) | 8 | 8 | 2006.8 | 1.56× |
 //!
-//! AMD EPYC Zen 4 (x86_64, 4 vCPU), cost 5, batch 16: scalar 564.2 h/s,
-//! SSE4.1 1.12×, AVX2 1.54×, AVX-512 1.42× (Zen 4's 64 KiB SoA working set
-//! and double-pumped 512-bit ops favor AVX2; see the README). Batch-16
-//! speedup vs the `bcrypt` crate: 3.01× (M5 Max) / 1.68× (Zen 4); full
-//! tables and the `parallel` numbers are in the README.
+//! AMD EPYC Zen 4 (x86_64, 4 vCPU), cost 5, batch 16: scalar 568.8 h/s,
+//! SSE4.1 1.11×, AVX2 1.58–1.67×, AVX-512 1.55–1.64× (parity on Zen 4; a
+//! one-time runtime width shootout picks per host — see the README).
+//! Batch-16 speedup vs the `bcrypt` crate: 4.29× (M5 Max) / 1.94× (Zen 4);
+//! full tables and the `parallel` numbers are in the README.
 //!
 //! The batch entry points are [`bcrypt_many`], [`hash_many`],
 //! [`hash_many_with_salts`] and [`verify_many`].

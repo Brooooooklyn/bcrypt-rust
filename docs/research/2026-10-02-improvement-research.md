@@ -71,3 +71,29 @@ a sentence in the `parallel` docs rather than code.
 1 → 2 → 3 (NEON sequence, each measured independently) → 4+5+6 (x86 sequence,
 shootout asserts equality per flavor) → 7 → 8. Every step gated on the full
 suite + micro numbers on M5 Max and the Zen 4 sandbox.
+
+## Measured outcomes (2026-10-03 — all eight items shipped)
+
+Commits: `28b44e3` (NEON 8-lane + wasm X2), `b041c6f` (x86 flavors),
+`eb056a1` (width shootout). Prediction vs measurement, per item:
+
+| # | predicted | measured | verdict |
+|---|---|---|---|
+| 1 asm identity barrier | +20–25% NEON | +10.5% (2230 → 2470 h/s) | half the model — the removed `str`/`ldr` pairs were only partly on the critical chain |
+| 2 ORR lane fold | enabler | −27% naive (LLVM reassociated lane constants into lane-adjusted bases + 2-cycle extended-register adds); fixed with a `gather_idx` opaque-asm barrier → the enabler it was designed to be |
+| 3 8-lane GPR interleave | 4,200–4,700 h/s | **3,194 h/s, 3.82×** (batch 16); 6-lane = 2,963–2,974 | ceiling model over-predicted: issue-bound at IPC ≈ 8.2, not load-bound. An AoS variant (vectors resident) measured IPC 5.2 and was rejected |
+| 4 prescaled byte offsets | +15–25% on insert | AVX2 **+18.9%** (665.6 → 791.6) | as predicted |
+| 5 macro-ize `f16_insert` | +10–15% AVX-512 | folded into the item-6 row — see below |
+| 4+5 + SLP blocker | — | AVX-512 **383.2 → 786.4 (+105%)**: LLVM 21 re-formed microcoded `vpgatherdd` out of the prescaled scalar-load pattern; an opaque-asm `lane_load!` per lane blocks it. AVX-512 now at parity with AVX2 (~890–950 h/s, rustc 1.99) |
+| 6 extract flavor | +10–20% on Zen | parity with insert — LLVM SROA canonicalizes both to identical code. Kept as a third byte-asserted shootout arm |
+| 7 width shootout | reliable width selection | shipped: cost-4 batch-32 through both backends, byte-identity asserted before timing, 3 interleaved reps, min wins, cached per process; ~0.4 s one-time, lazy (only batch entry points pay it). Picks AVX2 on Zen 4 in 5/6 processes — consistent with measured parity |
+| 8 wasm X2 | beat the 1.21× ceiling | **1.56×** (2,006.8 vs 1,286.7 h/s scalar-in-wasm). The key was a volatile-pinned rebuild of the gathered array blocking LLVM's `v128.load32_lane` serial-chain fusion; the same trick loses at 4 lanes (1.00×) — the mechanism is width-dependent |
+
+Re-confirmed during implementation: `#[inline(always)]` + `#[target_feature]`
+is still a hard error on rustc 1.98 (rust#145574); textual `macro_rules!`
+inlining remains the only route (item 5).
+
+Net result vs the pre-research baseline (cost 5, vs scalar): NEON 2.78× →
+**3.82×**, wasm128 1.21× → **1.56×**, AVX2 1.54× → **1.58–1.67×**, AVX-512
+1.42× → **1.55–1.64×**. Against the `bcrypt` crate, batch 16: M5 Max 3.01× →
+**4.29×**, Zen 4 1.68× → **1.94×**.
