@@ -34,16 +34,16 @@ aborts instead of posting a fast-but-wrong number).
 
 | backend | lanes | batch | hashes/s | vs scalar |
 |---|---|---|---|---|
-| scalar | 1 | 16 | 835.4 | 1.00 |
-| NEON | 8 | 8 | 3174.7 | **3.90×** |
-| NEON | 8 | 16 | 3193.8 | 3.82× |
-| NEON | 8 | 32 | 3190.7 | 3.80× |
+| scalar | 1 | 16 | 790.4 | 1.00 |
+| NEON | 8 | 8 | 3193.1 | **4.04×** |
+| NEON | 8 | 16 | 3187.1 | 4.03× |
+| NEON | 8 | 32 | 3167.5 | 4.00× |
 | wasm128 (under wasmtime 48, cost 4) | 8 | 8 | 2006.8 | 1.56× |
 
 The NEON backend is an 8-lane scalar-GPR interleave (John the Ripper's
 design: vector registers appear only at pack/unpack; the name is
 historical). It replaced a 4-lane vector kernel after measurement
-(2.78× → 3.82×). The wasm128 backend likewise runs two interleaved
+(2.78× → 4.03×). The wasm128 backend likewise runs two interleaved
 4-lane states (1.21× → 1.56×).
 
 **AMD EPYC Zen 4** (x86_64, Cloudflare sandbox, 4 vCPU), rustc 1.99.0, cost 5,
@@ -67,6 +67,12 @@ prescaled byte offsets plus an opaque-asm blocker that stops LLVM from
 re-forming microcoded gathers took the AVX-512 path from 383 h/s to
 parity.
 
+A 12-lane AVX2 kernel (`avx2_12`) targets 48 KiB-L1d chips (Zen 5, Ice
+Lake+): it joins the width shootout only when cpuid reports L1d ≥ 48 KiB,
+and only when it wins outright. Our lab has no such hardware, so no win is
+claimed — forced on Zen 4 it measures 0.76× (48 KiB thrashing a 32 KiB
+L1d), which is exactly why the gate exists.
+
 Single-hash latency, cost 4: **646 µs** (criterion, M5 Max). Throughput
 scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
 
@@ -83,8 +89,8 @@ the pattern real callers use today.
 |---|---|---|---|
 | single hash, cost 4 | 741 µs | 662 µs | 1.12× |
 | single hash, cost 12 | 174.7 ms | 161.2 ms | 1.08× |
-| batch 16, cost 4 | 1429 h/s | 6134 h/s | **4.29×** |
-| batch 16, cost 12 | 5.79 h/s | 25.30 h/s | **4.37×** |
+| batch 16, cost 4 | 1417 h/s | 6118 h/s | **4.32×** |
+| batch 16, cost 12 | 5.79 h/s | 25.13 h/s | **4.34×** |
 | verify, cost 4 | 718 µs | 666 µs | 1.08× |
 
 **AMD EPYC Zen 4, 4 vCPU** (batch arms re-measured after the x86 work;
@@ -133,6 +139,7 @@ already engages siblings.
 | NEON | 8 | aarch64 | native: full suite + the measurements above (M5 Max) |
 | SSE4.1 | 4 | x86, x86_64 | full suite under Rosetta 2 **and** under QEMU TCG (Debian 12, real cpuid) |
 | AVX2 | 8 | x86_64 | full suite under Rosetta 2 (`+avx2`) and QEMU TCG; the gather/insert/extract shootout asserts all three lookup flavors byte-identical before timing |
+| AVX2×12 | 12 | x86_64 | forced-run full suite (`BCRYPT_REQUIRE_BACKEND=avx2_12`, byte-exact vs scalar and crypt_blowfish) under Rosetta 2 and on the Zen 4 sandbox; self-selects only on 48 KiB-L1d µarchs (Zen 5, Ice Lake+) — no lab hardware, no perf claim |
 | AVX-512 | 16 | x86_64 | full suite on real Zen 4 hardware (Cloudflare sandbox) with `BCRYPT_REQUIRE_BACKEND=avx512` — byte-exact vs scalar, every other backend, and crypt_blowfish C; CI **requires** it on any runner advertising `avx512f` (macOS cannot execute it locally: Rosetta SIGILLs, QEMU TCG has no AVX-512 emulation) |
 | wasm128 | 8 | wasm32 | full suite + micro bench under wasmtime (`+simd128`), scalar-fallback leg without it |
 
@@ -144,8 +151,10 @@ Rapids), so `detect()` answers it by measurement: on `std` release builds, a
 host advertising both runs a one-time width shootout — a cost-4, 32-item
 batch through both backends' kernels, outputs asserted byte-identical before
 anything is timed, three interleaved reps each, min wins — and caches the
-winner for the process. Debug, `no_std` and Miri builds keep the static
-AVX-512-first order. To override the pick, force the backend through
+winner for the process. On hosts with L1d ≥ 48 KiB (Zen 5, Ice Lake+) the
+12-lane AVX2 kernel joins as a third arm, picked only if it wins outright —
+ties keep the wider incumbent. Debug, `no_std` and Miri builds keep the
+static AVX-512-first order. To override the pick, force the backend through
 `__internal::bcrypt_many_with_backend` (`internal-api` feature) or run the
 two explicitly and pick per machine, as `benches/micro.rs` does.
 
@@ -184,6 +193,7 @@ bcrypt_many / hash_many / hash_many_with_salts / verify_many
       │
       ▼
  avx512 ×16 ─ avx2 ×8 ─ sse41 ×4 ─ neon ×8 ─ wasm128 ×8 ─ scalar ×1
+              (avx2_12 ×12 — measured-shootout arm only, 48 KiB-L1d hosts)
       │
       ▼
  batch split into lane groups; short groups padded, padding discarded
