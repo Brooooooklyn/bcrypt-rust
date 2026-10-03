@@ -6,7 +6,9 @@
 //! the reference implementation, `dispatch` is what the crate actually
 //! runs (NEON on aarch64, AVX2/SSSE3 on x86-64, scalar elsewhere).
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use bcrypt_rust::__internal::{base64_scalar, decode_16, decode_23, encode_16, encode_23};
 

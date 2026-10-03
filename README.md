@@ -24,6 +24,14 @@ only**, by interleaving N *independent* hashes in lockstep, one per vector
 lane. Single-hash latency is unchanged — `hash` / `verify` always run the
 scalar kernel.
 
+The one other data-parallel step, the base64 codec, is vectorized too:
+NEON on aarch64, an AVX2/SSSE3 runtime pick on x86-64, v128 under wasm
+simd128, scalar tables elsewhere — every path byte-exact against the
+scalar reference, with the decode reject set pinned exhaustively in tests.
+Measured codec cost is ~20 ns against a 163 µs cost-4 hash (0.012%), so
+this is completeness of the SIMD story, not a throughput claim;
+`benches/base64.rs` is its regression net.
+
 ## Performance
 
 Measured via `benches/micro.rs` (correctness-gated: every timed iteration's

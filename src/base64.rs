@@ -16,7 +16,8 @@
 //! it carries SIMD kernels of its own: aarch64 always runs NEON (the
 //! feature is mandatory on the target), x86_64 picks AVX2 then SSSE3 at
 //! runtime on `std` builds (compile-time `target_feature` cfgs otherwise),
-//! and everything else runs the scalar tables. Every path is byte-exact
+//! wasm32 runs the v128 kernel under `simd128`, and everything else runs
+//! the scalar tables. Every path is byte-exact
 //! identical, reject set included — the differential tests below pin that.
 //! Measured share of one hash: ~20 ns against 163 µs at cost 4 (0.012%),
 //! so this is completeness of the SIMD story, not a throughput play.
@@ -55,6 +56,8 @@ pub mod scalar;
 pub(crate) mod neon;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) mod wasm128;
 
 /// Encode a 16-byte salt to its 22-char bcrypt base64 form.
 pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
@@ -62,6 +65,8 @@ pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
     return neon::encode_16(bytes);
     #[cfg(target_arch = "x86_64")]
     return x86::encode_16(bytes);
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return wasm128::encode_16(bytes);
     #[allow(unreachable_code)]
     scalar::encode_16(bytes)
 }
@@ -72,6 +77,8 @@ pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
     return neon::encode_23(bytes);
     #[cfg(target_arch = "x86_64")]
     return x86::encode_23(bytes);
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return wasm128::encode_23(bytes);
     #[allow(unreachable_code)]
     scalar::encode_23(bytes)
 }
@@ -82,6 +89,8 @@ pub(crate) fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
     return neon::decode_16(s);
     #[cfg(target_arch = "x86_64")]
     return x86::decode_16(s);
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return wasm128::decode_16(s);
     #[allow(unreachable_code)]
     scalar::decode_16(s)
 }
@@ -92,6 +101,8 @@ pub(crate) fn decode_23(s: &[u8]) -> Result<[u8; 23], ()> {
     return neon::decode_23(s);
     #[cfg(target_arch = "x86_64")]
     return x86::decode_23(s);
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return wasm128::decode_23(s);
     #[allow(unreachable_code)]
     scalar::decode_23(s)
 }

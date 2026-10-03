@@ -42,13 +42,26 @@
 //!
 //! # Dispatch
 //!
-//! `std` builds pick at runtime: AVX2, else SSSE3, else scalar. `no_std`
-//! has no runtime detection and falls back to compile-time
-//! `target_feature` cfgs, then scalar — the same split `crate::eks`
-//! uses. Under Miri both probes answer false: Miri does not interpret
-//! these intrinsics, and the `miri` CI job runs the `--lib` tests (the
-//! base64 differential included) — the same Scalar pin `eks::detect`
-//! applies.
+//! The pick is per operation, measured on Zen 4 (`benches/base64.rs`,
+//! medians of two criterion runs; ns):
+//!
+//! | op | scalar | SSSE3 | AVX2 | picked |
+//! |---|---|---|---|---|
+//! | encode_16 | 11.8 | **8.9** | 20.1 | SSSE3 |
+//! | encode_23 | 14.2 | **10.4** | 21.8 | SSSE3 |
+//! | decode_16 | 13.8 | 12.5 | **9.0** | AVX2 |
+//! | decode_23 | 18.8 | 15.4 | **12.5** | AVX2 |
+//!
+//! Encode is 128-bit: at a 24-byte payload the 256-bit expansion's fixed
+//! costs (the `vpermd` lane-join, the 32-byte tmp store-forward) exceed
+//! the work — the same reason aarch64's 128-bit NEON encode wins big.
+//! Decode is 256-bit: the scalar competitor does four dependent table
+//! loads per 3 bytes, so the wider range-arithmetic pays. `no_std` has no
+//! runtime detection and falls back to compile-time `target_feature`
+//! cfgs, then scalar — the same split `crate::eks` uses. Under Miri both
+//! probes answer false: Miri does not interpret these intrinsics, and the
+//! `miri` CI job runs the `--lib` tests (the base64 differential
+//! included) — the same Scalar pin `eks::detect` applies.
 //!
 //! # Rosetta note
 //!
@@ -417,13 +430,17 @@ unsafe fn decode_avx2<const CHARS: usize, const OUT: usize>(
 // ---------------------------------------------------------------------------
 
 /// Encode a 16-byte salt to its 22-char bcrypt base64 form.
+//
+// Encode prefers SSSE3 over AVX2 — see the "Dispatch" module docs: at a
+// 24-byte payload the 256-bit encode's fixed costs (vpermd lane-join +
+// the 32-byte tmp store-forward) exceed the work. Measured on Zen 4.
 pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
-    if have_avx2() {
-        // SAFETY: AVX2 was just detected (module docs for the probes).
-        unsafe { encode_avx2::<16, SALT_B64_LEN>(bytes) }
-    } else if have_ssse3() {
-        // SAFETY: SSSE3 was just detected.
+    if have_ssse3() {
+        // SAFETY: SSSE3 was just detected (module docs for the probes).
         unsafe { encode_ssse3::<16, SALT_B64_LEN>(bytes) }
+    } else if have_avx2() {
+        // SAFETY: AVX2 was just detected.
+        unsafe { encode_avx2::<16, SALT_B64_LEN>(bytes) }
     } else {
         scalar::encode_16(bytes)
     }
@@ -431,12 +448,12 @@ pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
 
 /// Encode the 23 hash bytes to their 31-char bcrypt base64 form.
 pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
-    if have_avx2() {
-        // SAFETY: AVX2 was just detected.
-        unsafe { encode_avx2::<23, HASH_B64_LEN>(bytes) }
-    } else if have_ssse3() {
+    if have_ssse3() {
         // SAFETY: SSSE3 was just detected.
         unsafe { encode_ssse3::<23, HASH_B64_LEN>(bytes) }
+    } else if have_avx2() {
+        // SAFETY: AVX2 was just detected.
+        unsafe { encode_avx2::<23, HASH_B64_LEN>(bytes) }
     } else {
         scalar::encode_23(bytes)
     }

@@ -95,6 +95,10 @@ pub fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
 }
 
 /// Decode exactly [`SALT_B64_LEN`] chars back to the 16-byte salt.
+// The unit error is the codec's exact contract (the only failure is "bad
+// char or length", with nothing to say about it) — every caller, including
+// the `__internal` wrappers, matches on `Ok`/`Err` alone.
+#[allow(clippy::result_unit_err)]
 pub fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
     if s.len() != SALT_B64_LEN {
         return Err(());
@@ -105,6 +109,7 @@ pub fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
 }
 
 /// Decode exactly [`HASH_B64_LEN`] chars back to the 23 hash bytes.
+#[allow(clippy::result_unit_err)]
 pub fn decode_23(s: &[u8]) -> Result<[u8; 23], ()> {
     if s.len() != HASH_B64_LEN {
         return Err(());

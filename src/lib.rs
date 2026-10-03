@@ -17,6 +17,10 @@
 //! Single-hash latency is unchanged, and [`hash`] / [`verify`] always run
 //! the scalar kernel — they never see a [`Backend`] value at all.
 //!
+//! The one other data-parallel step, the base64 codec, is vectorized as
+//! well: NEON on aarch64, an AVX2/SSSE3 runtime pick on x86-64, v128 under
+//! wasm simd128 — each byte-exact against the scalar tables it replaces.
+//!
 //! Measured batch gains (`benches/micro.rs` — every timed iteration
 //! asserted byte-identical to scalar). Apple M5 Max (aarch64), cost 5:
 //!

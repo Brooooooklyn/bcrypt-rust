@@ -100,12 +100,36 @@ fn bench_raw_core(c: &mut Criterion) {
     group.finish();
 }
 
+/// The dispatched base64 codec (`bench_raw_core` isolates a regression to
+/// "the codec" — these arms name it). Uses `__internal` because the codec
+/// is crate-private; what is timed is exactly what `hash`/`verify` run:
+/// NEON on aarch64, the AVX2/SSSE3 pick on x86-64, v128 under wasm simd128.
+fn bench_base64(c: &mut Criterion) {
+    use bcrypt_rust::__internal::{decode_23, encode_16, encode_23};
+
+    let hash_bytes = [0xA5u8; 23];
+    let enc23 = encode_23(&hash_bytes);
+    let mut group = c.benchmark_group("base64");
+
+    group.bench_function("encode_16", |b| {
+        b.iter(|| black_box(encode_16(black_box(&SALT))));
+    });
+    group.bench_function("encode_23", |b| {
+        b.iter(|| black_box(encode_23(black_box(&hash_bytes))));
+    });
+    group.bench_function("decode_23", |b| {
+        b.iter(|| black_box(decode_23(black_box(&enc23)).expect("decodes")));
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_single_hash, bench_batch, bench_raw_core
+    targets = bench_single_hash, bench_batch, bench_raw_core, bench_base64
 }
 criterion_main!(benches);
