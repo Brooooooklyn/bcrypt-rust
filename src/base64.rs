@@ -9,10 +9,21 @@
 //! encoding carries spare low bits. The encoder zeroes them (canonical
 //! form); the decoder ignores them, which is why decoding is only defined on
 //! the exact lengths below.
+//!
+//! # Dispatch
+//!
+//! The codec is the only data-parallel step outside the Blowfish core, so
+//! it carries SIMD kernels of its own: aarch64 always runs NEON (the
+//! feature is mandatory on the target), x86_64 picks AVX2 then SSSE3 at
+//! runtime on `std` builds (compile-time `target_feature` cfgs otherwise),
+//! and everything else runs the scalar tables. Every path is byte-exact
+//! identical, reject set included — the differential tests below pin that.
+//! Measured share of one hash: ~20 ns against 163 µs at cost 4 (0.012%),
+//! so this is completeness of the SIMD story, not a throughput play.
 
 /// The bcrypt alphabet: index 0 is `'.'`, 1 is `'/'`, then `A`–`Z`, `a`–`z`,
 /// `0`–`9` — *not* the RFC 4648 order.
-const ALPHABET: &[u8; 64] =
+pub(crate) const ALPHABET: &[u8; 64] =
     b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// Encoded length of a 16-byte salt.
@@ -22,10 +33,10 @@ pub(crate) const SALT_B64_LEN: usize = 22;
 pub(crate) const HASH_B64_LEN: usize = 31;
 
 /// Marker in [`DECODE`] for bytes outside the alphabet.
-const INVALID: u8 = 0xFF;
+pub(crate) const INVALID: u8 = 0xFF;
 
 /// Byte → 6-bit value, built at compile time.
-const DECODE: [u8; 256] = {
+pub(crate) const DECODE: [u8; 256] = {
     let mut table = [INVALID; 256];
     let mut i = 0;
     while i < 64 {
@@ -35,114 +46,54 @@ const DECODE: [u8; 256] = {
     table
 };
 
-/// MSB-first packing of `bytes` into alphabet chars; `out` is filled exactly.
-fn encode_into(bytes: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), (bytes.len() * 8).div_ceil(6));
-    let mut o = 0;
-    let mut groups = bytes.chunks_exact(3);
-    for g in &mut groups {
-        let (b0, b1, b2) = (g[0], g[1], g[2]);
-        out[o] = ALPHABET[(b0 >> 2) as usize];
-        out[o + 1] = ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
-        out[o + 2] = ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize];
-        out[o + 3] = ALPHABET[(b2 & 0x3f) as usize];
-        o += 4;
-    }
-    // Partial final group: one leftover byte contributes its 8 bits to two
-    // chars, two leftover bytes to three; the spare low bits stay zero.
-    match groups.remainder() {
-        [b0] => {
-            let b0 = *b0;
-            out[o] = ALPHABET[(b0 >> 2) as usize];
-            out[o + 1] = ALPHABET[((b0 & 0x03) << 4) as usize];
-        }
-        [b0, b1] => {
-            let (b0, b1) = (*b0, *b1);
-            out[o] = ALPHABET[(b0 >> 2) as usize];
-            out[o + 1] = ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
-            out[o + 2] = ALPHABET[((b1 & 0x0f) << 2) as usize];
-        }
-        _ => {}
-    }
-}
+/// The scalar tables — the reference every SIMD kernel is checked against.
+/// `pub` only so `__internal` (feature `internal-api`) can bench it; the
+/// module is crate-private without that feature.
+pub mod scalar;
 
-/// The 6-bit value of one char, or `Err` for a byte outside the alphabet.
-fn decode_char(c: u8) -> Result<u8, ()> {
-    match DECODE[c as usize] {
-        INVALID => Err(()),
-        v => Ok(v),
-    }
-}
-
-/// Inverse of [`encode_into`]; `out` is filled exactly. The spare low bits of
-/// a final partial group are discarded, matching every other bcrypt codec.
-fn decode_into(s: &[u8], out: &mut [u8]) -> Result<(), ()> {
-    debug_assert_eq!(out.len(), s.len() * 6 / 8);
-    let mut o = 0;
-    let mut groups = s.chunks_exact(4);
-    for g in &mut groups {
-        let v0 = decode_char(g[0])?;
-        let v1 = decode_char(g[1])?;
-        let v2 = decode_char(g[2])?;
-        let v3 = decode_char(g[3])?;
-        out[o] = (v0 << 2) | (v1 >> 4);
-        out[o + 1] = ((v1 & 0x0f) << 4) | (v2 >> 2);
-        out[o + 2] = ((v2 & 0x03) << 6) | v3;
-        o += 3;
-    }
-    match groups.remainder() {
-        [] => Ok(()),
-        [c0, c1] => {
-            let v0 = decode_char(*c0)?;
-            let v1 = decode_char(*c1)?;
-            out[o] = (v0 << 2) | (v1 >> 4);
-            Ok(())
-        }
-        [c0, c1, c2] => {
-            let v0 = decode_char(*c0)?;
-            let v1 = decode_char(*c1)?;
-            let v2 = decode_char(*c2)?;
-            out[o] = (v0 << 2) | (v1 >> 4);
-            out[o + 1] = ((v1 & 0x0f) << 4) | (v2 >> 2);
-            Ok(())
-        }
-        // A lone leftover char carries only 6 bits — never a whole byte.
-        _ => Err(()),
-    }
-}
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod neon;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86;
 
 /// Encode a 16-byte salt to its 22-char bcrypt base64 form.
 pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
-    let mut out = [0u8; SALT_B64_LEN];
-    encode_into(bytes, &mut out);
-    out
+    #[cfg(target_arch = "aarch64")]
+    return neon::encode_16(bytes);
+    #[cfg(target_arch = "x86_64")]
+    return x86::encode_16(bytes);
+    #[allow(unreachable_code)]
+    scalar::encode_16(bytes)
 }
 
 /// Encode the 23 hash bytes to their 31-char bcrypt base64 form.
 pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
-    let mut out = [0u8; HASH_B64_LEN];
-    encode_into(bytes, &mut out);
-    out
+    #[cfg(target_arch = "aarch64")]
+    return neon::encode_23(bytes);
+    #[cfg(target_arch = "x86_64")]
+    return x86::encode_23(bytes);
+    #[allow(unreachable_code)]
+    scalar::encode_23(bytes)
 }
 
 /// Decode exactly [`SALT_B64_LEN`] chars back to the 16-byte salt.
 pub(crate) fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
-    if s.len() != SALT_B64_LEN {
-        return Err(());
-    }
-    let mut out = [0u8; 16];
-    decode_into(s, &mut out)?;
-    Ok(out)
+    #[cfg(target_arch = "aarch64")]
+    return neon::decode_16(s);
+    #[cfg(target_arch = "x86_64")]
+    return x86::decode_16(s);
+    #[allow(unreachable_code)]
+    scalar::decode_16(s)
 }
 
 /// Decode exactly [`HASH_B64_LEN`] chars back to the 23 hash bytes.
 pub(crate) fn decode_23(s: &[u8]) -> Result<[u8; 23], ()> {
-    if s.len() != HASH_B64_LEN {
-        return Err(());
-    }
-    let mut out = [0u8; 23];
-    decode_into(s, &mut out)?;
-    Ok(out)
+    #[cfg(target_arch = "aarch64")]
+    return neon::decode_23(s);
+    #[cfg(target_arch = "x86_64")]
+    return x86::decode_23(s);
+    #[allow(unreachable_code)]
+    scalar::decode_23(s)
 }
 
 #[cfg(test)]
@@ -226,5 +177,37 @@ mod tests {
         assert!(decode_23(b"7uG0VCzI2bS7j6ymqJi9CdcdxiRTWN").is_err());
         assert!(decode_23(&[b'C'; 32]).is_err());
         assert!(decode_16(&[]).is_err());
+    }
+
+    /// The dispatched path (SIMD where compiled) must be byte-exact against
+    /// the scalar tables — outputs AND the reject set. Exhaustive over every
+    /// byte value at every position, plus random whole-string round-trips.
+    #[test]
+    fn dispatch_matches_scalar() {
+        let mut rng = Rng(0xB529_7A4D_1D2B_9F83);
+        let mut b16 = [0u8; 16];
+        let mut b23 = [0u8; 23];
+        for _ in 0..512 {
+            rng.fill(&mut b16);
+            rng.fill(&mut b23);
+            assert_eq!(encode_16(&b16), scalar::encode_16(&b16));
+            assert_eq!(encode_23(&b23), scalar::encode_23(&b23));
+        }
+        let base16 = *b"CCCCCCCCCCCCCCCCCCCCCC";
+        let base23 = *b"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        for pos in 0..SALT_B64_LEN {
+            for c in 0..=u8::MAX {
+                let mut s = base16;
+                s[pos] = c;
+                assert_eq!(decode_16(&s), scalar::decode_16(&s), "16: pos {pos} c {c:#04x}");
+            }
+        }
+        for pos in 0..HASH_B64_LEN {
+            for c in 0..=u8::MAX {
+                let mut s = base23;
+                s[pos] = c;
+                assert_eq!(decode_23(&s), scalar::decode_23(&s), "23: pos {pos} c {c:#04x}");
+            }
+        }
     }
 }

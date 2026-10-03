@@ -104,6 +104,12 @@ harness = false
 name = "micro"
 harness = false
 
+# Scalar vs SIMD base64 codec — the regression net for the NEON/AVX2/SSSE3
+# kernels (the codec is ~0.012% of a cost-4 hash; see the module docs).
+[[bench]]
+name = "base64"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"

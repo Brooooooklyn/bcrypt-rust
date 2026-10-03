@@ -252,6 +252,12 @@ pub mod __internal {
     pub use crate::eks::{Backend, BcryptLanesFn, backend, bcrypt_lanes_fn, detect};
     pub use crate::encoding::HashParts;
 
+    /// The scalar base64 tables — the reference the SIMD kernels are
+    /// checked against, exposed so benches can time dispatch against it.
+    pub mod base64_scalar {
+        pub use crate::base64::scalar::{decode_16, decode_23, encode_16, encode_23};
+    }
+
     // The base64 codec and wipe helpers are `pub(crate)` in their modules,
     // so they cannot be re-exported; these thin inline wrappers are the
     // same functions by another name.
