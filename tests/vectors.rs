@@ -248,7 +248,12 @@ fn wrong_password(pw: &[u8]) -> Vec<u8> {
 
 /// Re-encode a raw 24-byte core output into the 60-char hash string, using
 /// the crate's own bcrypt base64 (reachable from integration tests via the
-/// `internal-api` dev feature).
+/// `internal-api` dev feature). Gated on it: the packaged crate builds its
+/// tests without `internal-api` — the path-only self dev-dependency that
+/// enables it locally is stripped from the published manifest — and this
+/// helper plus its one call site are the only `__internal` uses in this
+/// otherwise public-API file.
+#[cfg(feature = "internal-api")]
 fn reencode(version: Version, cost: u32, salt: &[u8; 16], out: &[u8; 24]) -> String {
     let mut payload = [0u8; 23];
     payload.copy_from_slice(&out[..23]);
@@ -327,7 +332,8 @@ fn batch_matches_single() {
                 i + 1
             );
             // ...and re-encoding the lane output reproduces the original
-            // 60-char string, prefix included.
+            // 60-char string, prefix included (gated like `reencode`).
+            #[cfg(feature = "internal-api")]
             assert_eq!(
                 reencode(version_of(VECTORS[i].hash), *cost, &salts[j], &outs[j]),
                 VECTORS[i].hash,

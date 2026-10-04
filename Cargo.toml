@@ -12,7 +12,12 @@ repository = "https://github.com/Brooooooklyn/bcrypt-rust"
 homepage = "https://github.com/Brooooooklyn/bcrypt-rust"
 documentation = "https://docs.rs/bcrypt-rust"
 readme = "README.md"
-exclude = ["/.github", "/benches", "/tests", "/fuzz", "/crypt_blowfish", "/docs"]
+# tests/ and benches/ ship in the package: their targets are declared in the
+# manifest, so excluding the files makes `cargo package` warn about every one
+# of them. In the packaged crate the path-only self dev-dependency is
+# stripped, so `internal-api` is off and its consumers cfg-gate themselves
+# out (`__internal` uses in tests/, and `tests/differential.rs` with it).
+exclude = ["/.github", "/fuzz", "/crypt_blowfish", "/docs"]
 keywords = ["bcrypt", "password-hash", "simd", "crypto", "blowfish"]
 categories = ["cryptography", "no-std"]
 # Bench targets are declared explicitly as they land; `benches/support/` is a
