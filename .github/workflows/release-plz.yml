@@ -1,0 +1,69 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Two jobs per run: `release` publishes whatever Cargo.toml version is not
+# yet on crates.io (incl. the first publish of a fresh version), `release-pr`
+# keeps a standing "release PR" updated with the next version bump and the
+# generated changelog. Merging that PR is what releases it.
+#
+# Required repo state:
+# * Settings > Actions > General > "Allow GitHub Actions to create and
+#   approve pull requests" — ON (set via the API).
+# * Secret CARGO_REGISTRY_TOKEN — crates.io token with publish-new +
+#   publish-update scopes. NOTE: adding it means the next push to main
+#   publishes the current manifest version.
+# * Optional secret RELEASE_PLZ_TOKEN — a PAT (repo + workflow scopes) or
+#   GitHub App token. Without it the release PR is opened by GITHUB_TOKEN,
+#   whose PRs do not trigger pull_request workflows — so the required
+#   `done` check never runs on the release PR and merging needs an admin
+#   override. With it, CI runs on the release PR like any other.
+jobs:
+  release-plz-release:
+    name: release (publish unpublished versions)
+    if: github.repository == 'Brooooooklyn/bcrypt-rust' # never in forks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push tags, create GitHub releases
+      pull-requests: read # detect the release PR and its commits
+    steps:
+      - &checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history: the release must happen from the release PR's
+          # latest commit, not from a shallow HEAD.
+          fetch-depth: 0
+          persist-credentials: false
+      - &install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release-plz-pr:
+    name: release PR (version bump + changelog)
+    if: github.repository == 'Brooooooklyn/bcrypt-rust'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release-PR branch
+      pull-requests: write # open/update the release PR
+    concurrency:
+      # Serialize release-PR updates for one branch: a newer push waits for
+      # the in-flight one instead of racing it.
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - *checkout
+      - *install-rust
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
