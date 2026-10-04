@@ -443,18 +443,23 @@ static CACHED_WIDTH: AtomicU8 = AtomicU8::new(UNINIT);
 /// when the answer is at least 48 KiB — the L1d of Zen 5, Ice Lake and
 /// later Intel cores, and exactly the 12-lane kernel's working set.
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
+// cpuid is a plain read-only instruction, but on our MSRV (1.89) it is
+// still declared `unsafe fn`; newer rustc marks it safe, so the unsafe
+// blocks would warn there — allow(unused_unsafe) keeps both toolchains
+// warning-free.
+#[allow(unused_unsafe)]
 fn l1d_size() -> Option<usize> {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     // Leaf 4 exists on every CPU the shootout can run on (AVX-512F is
     // decades newer), but a hypervisor could mask it — probe defensively.
-    if __cpuid(0).eax < 4 {
+    if unsafe { __cpuid(0) }.eax < 4 {
         return None;
     }
     // Sub-leaves enumerate the cache hierarchy; type 0 ends the list. The
     // 16-iteration cap is paranoia against a broken cpuid, never hit in
     // practice (real hierarchies have ≤ 4 entries).
     for sub_leaf in 0..16u32 {
-        let r = __cpuid_count(4, sub_leaf);
+        let r = unsafe { __cpuid_count(4, sub_leaf) };
         let cache_type = r.eax & 0x1f;
         if cache_type == 0 {
             break;

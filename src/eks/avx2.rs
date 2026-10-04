@@ -21,10 +21,10 @@
 //! * **Gather** — [`lookup8_gather`], one `vpgatherdd` per box. Fast on
 //!   Intel (hardware gather); on AMD Zen 2–4 `vpgatherdd` is microcoded
 //!   and loses ~2–3× to scalar loads.
-//! * **Insert** — [`lookup8_insert!`]: store the prescaled byte-offset
+//! * **Insert** — `lookup8_insert!`: store the prescaled byte-offset
 //!   vector, eight scalar loads, load the result back. On Intel this runs
 //!   ~10–20 % behind the hardware gather.
-//! * **Extract** — [`lookup8_extract!`]: `vpextrd` each prescaled offset
+//! * **Extract** — `lookup8_extract!`: `vpextrd` each prescaled offset
 //!   lane to a GPR, scalar load, `vpinsrd` rebuild — no stack round-trip
 //!   and no store-forward link at all (the shape LLVM's optimizer
 //!   usually — but not reliably — turns Insert into).
@@ -56,7 +56,7 @@
 //!
 //! Every index vector handed to the lookups is derived from a byte-masked
 //! value (a `>> 24` or `& 0xff` of a `u32` lane) produced inside
-//! [`f8_gather`] / [`f8_insert!`] / [`f8_extract!`]. The gather flavor
+//! [`f8_gather`] / `f8_insert!` / `f8_extract!`. The gather flavor
 //! receives the byte itself (`0..=255`), so `idx * 8 + lane` stays inside
 //! the addressed 256-entry box; the insert and extract flavors receive it
 //! prescaled to a byte offset (`idx * 32`, via an `& 0x1fe0` mask), so
@@ -156,7 +156,7 @@ unsafe fn lookup8_gather(box_base: *const i32, idx: __m256i, lane_off: __m256i) 
 /// byte-offset vector to the stack, eight scalar loads in GPR code, load
 /// the result back. `$off` lane `l` must already hold the byte offset
 /// `idx_l * 32` (the [`SBoxes8`] entry stride) — prescaling in vector
-/// form in [`f8_insert!`] removes the per-lane GPR `shl` chains the
+/// form in `f8_insert!` removes the per-lane GPR `shl` chains the
 /// word-index spelling needed, so every load here is displacement-only.
 /// The flavor that wins where gathers are microcoded.
 ///
@@ -206,7 +206,7 @@ macro_rules! lookup8_insert {
     }};
 }
 
-/// [`lookup8_insert!`] without the stack round-trip, as a MACRO (same
+/// `lookup8_insert!` without the stack round-trip, as a MACRO (same
 /// force-inline reasoning): `vpextrd` each prescaled offset lane to a
 /// GPR, scalar load, `vpinsrd` rebuild into a vector register. Removes
 /// the store-forward link entirely — the shape LLVM's optimizer usually,
@@ -214,7 +214,7 @@ macro_rules! lookup8_insert {
 ///
 /// # Safety
 ///
-/// Same contract as [`lookup8_insert!`].
+/// Same contract as `lookup8_insert!`.
 macro_rules! lookup8_extract {
     ($box_base:expr, $off:expr) => {{
         let base = ($box_base).cast::<u8>();
@@ -280,7 +280,7 @@ fn f8_gather(s: &SBoxes8, x: __m256i) -> __m256i {
 }
 
 /// [`f8_gather`], insert flavor, as a MACRO — textually inlined at every
-/// call site for the same reason [`lookup8_insert!`] is a macro (LLVM
+/// call site for the same reason `lookup8_insert!` is a macro (LLVM
 /// outlined the scalar-load F as 16 `callq` per encipher;
 /// `#[inline(always)]` on `#[target_feature]` is a hard error). Identical
 /// math to [`f8_gather`] — see the module-level flavor notes. The byte
@@ -312,8 +312,8 @@ macro_rules! f8_insert {
     }};
 }
 
-/// [`f8_insert!`], extract flavor: identical math through
-/// [`lookup8_extract!`] — same prescaled extraction, no stack round-trip.
+/// `f8_insert!`, extract flavor: identical math through
+/// `lookup8_extract!` — same prescaled extraction, no stack round-trip.
 /// A macro for the same force-inline reason.
 macro_rules! f8_extract {
     ($s:expr, $x:expr) => {{
@@ -339,7 +339,7 @@ macro_rules! f8_extract {
 }
 
 /// The flavor-dispatched F, as a MACRO so the scalar-load flavors get
-/// textual inlining (see [`f8_insert!`]). `$flavor` is the caller's
+/// textual inlining (see `f8_insert!`). `$flavor` is the caller's
 /// const generic (one of [`FLAVOR_GATHER`] / [`FLAVOR_INSERT`] /
 /// [`FLAVOR_EXTRACT`]), so the branch folds at monomorphization and no
 /// per-lookup branch exists in any kernel path.

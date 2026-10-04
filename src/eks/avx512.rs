@@ -43,9 +43,9 @@
 //!
 //! * **Gather** — [`lookup16_gather`], one `vpgatherdd` per box. Fast on
 //!   Intel parts with a hardware gather.
-//! * **Insert** — [`lookup16_insert!`]: store the prescaled byte-offset
+//! * **Insert** — `lookup16_insert!`: store the prescaled byte-offset
 //!   vector, sixteen scalar loads, load the result back.
-//! * **Extract** — [`lookup16_extract!`]: `vpextrd` each prescaled offset
+//! * **Extract** — `lookup16_extract!`: `vpextrd` each prescaled offset
 //!   lane (via 128-bit chunks) to a GPR, scalar load,
 //!   `vpinsrd`/`vinserti32x4` rebuild — no stack round-trip and no
 //!   store-forward link at all (the shape LLVM's optimizer usually — but
@@ -68,7 +68,7 @@
 //!
 //! Every index vector handed to the lookups is derived from a byte-masked
 //! value (a `>> 24` or `& 0xff` of a `u32` lane) produced inside
-//! [`f16_gather`] / [`f16_insert!`] / [`f16_extract!`]. The gather flavor
+//! [`f16_gather`] / `f16_insert!` / `f16_extract!`. The gather flavor
 //! receives the byte itself (`0..=255`), so `idx * 16 + lane` stays
 //! inside the addressed 256-entry box; the insert and extract flavors
 //! receive it prescaled to a byte offset (`idx * 64`, via an `& 0x3fc0`
@@ -241,12 +241,12 @@ macro_rules! lookup16_insert {
     }};
 }
 
-/// [`lookup16_insert!`] without the stack round-trip, as a MACRO (same
+/// `lookup16_insert!` without the stack round-trip, as a MACRO (same
 /// force-inline reasoning): split the offset vector into its four
 /// 128-bit chunks, `vpextrd` each prescaled lane to a GPR, scalar load,
 /// `vpinsrd` rebuild per chunk, `vinserti32x4` reassembly. No store-
 /// forward link at all. Same contract and prescaling as
-/// [`lookup16_insert!`].
+/// `lookup16_insert!`.
 macro_rules! lookup16_extract {
     ($box_base:expr, $off:expr) => {{
         let base = ($box_base).cast::<u8>();
@@ -349,7 +349,7 @@ fn f16_gather(s: &SBoxes16, x: __m512i) -> __m512i {
 }
 
 /// [`f16_gather`], insert flavor, as a MACRO — textually inlined at every
-/// call site for the same reason [`lookup16_insert!`] is a macro (an
+/// call site for the same reason `lookup16_insert!` is a macro (an
 /// outlined 16-lane F cost 16 `callq` + zmm sret spills per encipher;
 /// `#[inline(always)]` on `#[target_feature]` is a hard error). Identical
 /// math to [`f16_gather`]. The byte extraction folds the ×64 stride into
@@ -380,8 +380,8 @@ macro_rules! f16_insert {
     }};
 }
 
-/// [`f16_insert!`], extract flavor: identical math through
-/// [`lookup16_extract!`] — same prescaled extraction, no stack
+/// `f16_insert!`, extract flavor: identical math through
+/// `lookup16_extract!` — same prescaled extraction, no stack
 /// round-trip. A macro for the same force-inline reason.
 macro_rules! f16_extract {
     ($s:expr, $x:expr) => {{
@@ -408,7 +408,7 @@ macro_rules! f16_extract {
 }
 
 /// The flavor-dispatched F, as a MACRO so the scalar-load flavors get
-/// textual inlining (see [`f16_insert!`]). `$flavor` is the caller's
+/// textual inlining (see `f16_insert!`). `$flavor` is the caller's
 /// const generic (one of [`FLAVOR_GATHER`] / [`FLAVOR_INSERT`] /
 /// [`FLAVOR_EXTRACT`]), so the branch folds at monomorphization and no
 /// per-lookup branch exists in any kernel path.
