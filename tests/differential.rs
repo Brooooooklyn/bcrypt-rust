@@ -142,7 +142,9 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use bcrypt_rust::__internal::{bcrypt_many_with_backend, decode_16, encode_16, encode_23};
-use bcrypt_rust::{Backend, HashParts, Version, bcrypt_many, detected_backend, hash_with_salt, verify};
+use bcrypt_rust::{
+    Backend, HashParts, Version, bcrypt_many, detected_backend, hash_with_salt, verify,
+};
 
 /// The one constant the whole sweep hangs off. Change it to explore a
 /// different corner of the space; failures stay reproducible either way.
@@ -332,16 +334,14 @@ fn build_harness() -> Result<PathBuf, NoCompiler> {
     };
 
     let build_dir = root.join("target").join("differential-harness");
-    fs::create_dir_all(&build_dir)
-        .unwrap_or_else(|e| panic!("mkdir {}: {e}", build_dir.display()));
+    fs::create_dir_all(&build_dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", build_dir.display()));
 
     let source = build_dir.join("harness.c");
     let stale = fs::read_to_string(&source)
         .map(|s| s != HARNESS_C)
         .unwrap_or(true);
     if stale {
-        fs::write(&source, HARNESS_C)
-            .unwrap_or_else(|e| panic!("write {}: {e}", source.display()));
+        fs::write(&source, HARNESS_C).unwrap_or_else(|e| panic!("write {}: {e}", source.display()));
     }
 
     // One object per vendored source, compiled next to the harness (never
@@ -433,7 +433,13 @@ struct Case {
 
 impl fmt::Debug for Case {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "setting {:?} pwd[{}] {}", self.setting, self.pwd.len(), hex(&self.pwd))
+        write!(
+            f,
+            "setting {:?} pwd[{}] {}",
+            self.setting,
+            self.pwd.len(),
+            hex(&self.pwd)
+        )
     }
 }
 
@@ -461,7 +467,11 @@ impl Case {
         Case {
             setting: canonical_setting(version, cost, &salt),
             pwd,
-            kind: CaseKind::Hash { version, cost, salt },
+            kind: CaseKind::Hash {
+                version,
+                cost,
+                salt,
+            },
         }
     }
 
@@ -492,7 +502,12 @@ impl Case {
     /// from the *parts*, so a non-canonical `setting` still expects the
     /// canonical spelling in the output.
     fn expected(&self, out: &[u8; 24]) -> String {
-        let CaseKind::Hash { version, cost, salt } = &self.kind else {
+        let CaseKind::Hash {
+            version,
+            cost,
+            salt,
+        } = &self.kind
+        else {
             unreachable!("expected() is only called on hashing cases")
         };
         let mut payload = [0u8; 23];
@@ -685,7 +700,12 @@ fn compare(label: &str, cases: &[Case], c_results: &[CResult]) -> (usize, usize)
 /// `Driver::PublicApi`'s per-case answer: the single-hash public path,
 /// formatting through [`HashParts`] exactly as a real caller would.
 fn single_answer(case: &Case) -> String {
-    let CaseKind::Hash { version, cost, salt } = &case.kind else {
+    let CaseKind::Hash {
+        version,
+        cost,
+        salt,
+    } = &case.kind
+    else {
         unreachable!("single_answer is only called on hashing cases")
     };
     hash_with_salt(&case.pwd, *cost, *salt)
@@ -728,7 +748,11 @@ fn batch_answers(driver: Driver, cases: &[Case]) -> Vec<Option<String>> {
             Driver::PublicApi => unreachable!("returned early above"),
         }
         .unwrap_or_else(|e| panic!("batch driver {driver:?} failed at cost {cost}: {e:?}"));
-        assert_eq!(outs.len(), idxs.len(), "batch outputs are position-preserving");
+        assert_eq!(
+            outs.len(),
+            idxs.len(),
+            "batch outputs are position-preserving"
+        );
         for (j, &i) in idxs.iter().enumerate() {
             answers[i] = Some(cases[i].expected(&outs[j]));
         }
@@ -1014,11 +1038,21 @@ fn expensive_costs() {
     let mut cases = Vec::new();
     for i in 0..8 {
         let version = PREFIXES[i % 2];
-        cases.push(Case::hash(version, 7, rng.salt(), rng.password(lens[i % 4])));
+        cases.push(Case::hash(
+            version,
+            7,
+            rng.salt(),
+            rng.password(lens[i % 4]),
+        ));
     }
     for i in 0..4 {
         let version = PREFIXES[i % 2];
-        cases.push(Case::hash(version, 8, rng.salt(), rng.password(lens[(i + 1) % 4])));
+        cases.push(Case::hash(
+            version,
+            8,
+            rng.salt(),
+            rng.password(lens[(i + 1) % 4]),
+        ));
     }
 
     let (hashed, rejected) = assert_batch_agrees("expensive", &cases);
@@ -1104,8 +1138,7 @@ fn error_parity_malformed_settings() {
 /// bits as the canonical 22nd salt char but different spare low bits. A
 /// wrong copy would be caught immediately, because the C validates the
 /// spelling against its own `itoa64`.
-const ALPHABET: &[u8; 64] =
-    b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const ALPHABET: &[u8; 64] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// The 22nd salt char carries only the top 2 of its 6 bits (16 bytes = 21⅓
 /// groups). The C decodes it, then re-emits the *canonical* char on output
@@ -1175,7 +1208,11 @@ fn the_comparison_catches_a_wrong_answer() {
 
     // Baseline: uncorrupted, this must pass.
     assert_eq!(
-        compare("control-baseline", &[valid.clone(), invalid.clone()], &truth),
+        compare(
+            "control-baseline",
+            &[valid.clone(), invalid.clone()],
+            &truth
+        ),
         (1, 1)
     );
 

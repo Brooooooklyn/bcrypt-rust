@@ -194,15 +194,15 @@ mod random;
 
 pub use crate::core::{
     DEFAULT_COST, MAX_COST, MIN_COST, bcrypt, hash_with_salt, hash_with_salt_bytes,
-    non_truncating_hash_with_salt, non_truncating_hash_with_salt_bytes,
-    non_truncating_verify, verify,
+    non_truncating_hash_with_salt, non_truncating_hash_with_salt_bytes, non_truncating_verify,
+    verify,
 };
 #[cfg(feature = "alloc")]
 pub use crate::core::{bcrypt_many, hash_many_with_salts, verify_many};
 #[cfg(feature = "std")]
 pub use crate::core::{
-    hash, hash_bytes, hash_many, hash_with_result, non_truncating_hash,
-    non_truncating_hash_bytes, non_truncating_hash_with_result,
+    hash, hash_bytes, hash_many, hash_with_result, non_truncating_hash, non_truncating_hash_bytes,
+    non_truncating_hash_with_result,
 };
 pub use crate::eks::Backend;
 pub use crate::encoding::{HashParts, Version};
@@ -249,9 +249,9 @@ pub mod __internal {
     //! be safe, and why turning on `internal-api` cannot make a
     //! `#![forbid(unsafe_code)]` program reachable by UB.
 
-    pub use crate::core::constant_time_eq;
     #[cfg(feature = "alloc")]
     pub use crate::core::bcrypt_many_with_backend;
+    pub use crate::core::constant_time_eq;
     pub use crate::eks::scalar;
     pub use crate::eks::{Backend, BcryptLanesFn, backend, bcrypt_lanes_fn, detect};
     pub use crate::encoding::HashParts;
@@ -311,13 +311,13 @@ pub mod __internal {
     /// Each backend's `bcrypt_lanes`, reachable directly so a differential
     /// test can pit two backends against each other on the same inputs.
     pub mod backends {
-        pub use crate::eks::scalar;
-        #[cfg(target_arch = "aarch64")]
-        pub use crate::eks::neon;
         #[cfg(target_arch = "x86_64")]
         pub use crate::eks::avx2;
         #[cfg(target_arch = "x86_64")]
         pub use crate::eks::avx512;
+        #[cfg(target_arch = "aarch64")]
+        pub use crate::eks::neon;
+        pub use crate::eks::scalar;
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         pub use crate::eks::sse41;
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]

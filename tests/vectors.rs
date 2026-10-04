@@ -38,8 +38,7 @@
 use std::collections::BTreeMap;
 
 use bcrypt_rust::{
-    BcryptError, HashParts, Version, bcrypt, bcrypt_many, hash, hash_with_salt, verify,
-    verify_many,
+    BcryptError, HashParts, Version, bcrypt, bcrypt_many, hash, hash_with_salt, verify, verify_many,
 };
 
 /// One (password, hash) pair that the correct bcrypt algorithm reproduces.
@@ -145,29 +144,57 @@ struct Divergent {
 static DIVERGENT: &[Divergent] = &[
     // #43 OW — `$2x$` buggy sign extension; the buggy hash of "\xa3"
     // collides with the CORRECT hash of "\xff\xff\xa3" (#29/#30).
-    Divergent { password: b"\xa3", hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e", must_verify: false },
+    Divergent {
+        password: b"\xa3",
+        hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e",
+        must_verify: false,
+    },
     // #44 OW — for "\xff\xff\xa3" the bug is benign: buggy and correct key
     // schedules coincide, so this `$2x$` output IS the correct hash
     // (== #29/#30) and must verify. The genuinely divergent `$2a$` sibling
     // is the next row.
-    Divergent { password: b"\xff\xff\xa3", hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e", must_verify: true },
+    Divergent {
+        password: b"\xff\xff\xa3",
+        hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e",
+        must_verify: true,
+    },
     // #45 OW — `$2a$` 8-bit anti-collision safety XOR; a deliberate deviation
     // from the correct algorithm that must NOT reproduce.
-    Divergent { password: b"\xff\xff\xa3", hash: "$2a$05$/OK.fbVrR/bpIqNJ5ianF.nqd1wy.pTMdcvrRWxyiGL2eMz.2a85.", must_verify: false },
+    Divergent {
+        password: b"\xff\xff\xa3",
+        hash: "$2a$05$/OK.fbVrR/bpIqNJ5ianF.nqd1wy.pTMdcvrRWxyiGL2eMz.2a85.",
+        must_verify: false,
+    },
     // #46 OW — `$2x$` buggy; the correct hash of "1\xa3345" is unrelated
     // ($2y$05$/OK.fbVrR/bpIqNJ5ianF.ykhStlibHmUn6GomsWXnJvyvZx4vmvy).
-    Divergent { password: b"1\xa3345", hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.o./n25XVfn6oAPaUvHe.Csk4zRfsYPi", must_verify: false },
+    Divergent {
+        password: b"1\xa3345",
+        hash: "$2x$05$/OK.fbVrR/bpIqNJ5ianF.o./n25XVfn6oAPaUvHe.Csk4zRfsYPi",
+        must_verify: false,
+    },
     // #47 OW — `$2y$` IS the correct algorithm, so this must verify.
     // crypt_blowfish emits the identical hash under `$2a$` too (the safety
     // XOR does not trigger for this password); the buggy sibling is the
     // `$2x$` row with the "o./n25…" payload.
-    Divergent { password: b"\xff\xa3345", hash: "$2y$05$/OK.fbVrR/bpIqNJ5ianF.nRht2l/HRhr6zmCp9vYUvvsqynflf9e", must_verify: true },
+    Divergent {
+        password: b"\xff\xa3345",
+        hash: "$2y$05$/OK.fbVrR/bpIqNJ5ianF.nRht2l/HRhr6zmCp9vYUvvsqynflf9e",
+        must_verify: true,
+    },
     // #48 OW — `$2x$` buggy (correct hash: $2y$05$/OK…E737eUK7jOqGXQUPcu5iAm8pR815Cru).
-    Divergent { password: b"\xd1\x91", hash: "$2x$05$6bNw2HLQYeqHYyBfLMsv/OiwqTymGIGzFsA4hOTWebfehXHNprcAS", must_verify: false },
+    Divergent {
+        password: b"\xd1\x91",
+        hash: "$2x$05$6bNw2HLQYeqHYyBfLMsv/OiwqTymGIGzFsA4hOTWebfehXHNprcAS",
+        must_verify: false,
+    },
     // Survey positive #33, moved here: crypt_blowfish's `$2a$` safety-XOR
     // output for this password. Its correct-algorithm sibling is positive
     // vector #33 ("$2y$…o./n25…") above.
-    Divergent { password: b"\xff\xa334\xff\xff\xff\xa3345", hash: "$2a$05$/OK.fbVrR/bpIqNJ5ianF.ZC1JEJ8Z4gPfpe1JOr/oyPXTWl9EFd.", must_verify: false },
+    Divergent {
+        password: b"\xff\xa334\xff\xff\xff\xa3345",
+        hash: "$2a$05$/OK.fbVrR/bpIqNJ5ianF.ZC1JEJ8Z4gPfpe1JOr/oyPXTWl9EFd.",
+        must_verify: false,
+    },
 ];
 
 /// (password, buggy hash, correct sibling from `VECTORS`): the buggy rows
@@ -175,11 +202,23 @@ static DIVERGENT: &[Divergent] = &[
 /// buggy hash supplies cost + salt; recomputing must yield the sibling.
 static SIBLINGS: &[(&[u8], &str, &str)] = &[
     // #43's correct sibling is #31/#32.
-    (b"\xa3", "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e", "$2a$05$/OK.fbVrR/bpIqNJ5ianF.Sa7shbm4.OzKpvFnX1pQLmQW96oUlCq"),
+    (
+        b"\xa3",
+        "$2x$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e",
+        "$2a$05$/OK.fbVrR/bpIqNJ5ianF.Sa7shbm4.OzKpvFnX1pQLmQW96oUlCq",
+    ),
     // #45's correct sibling is #29/#30.
-    (b"\xff\xff\xa3", "$2a$05$/OK.fbVrR/bpIqNJ5ianF.nqd1wy.pTMdcvrRWxyiGL2eMz.2a85.", "$2b$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e"),
+    (
+        b"\xff\xff\xa3",
+        "$2a$05$/OK.fbVrR/bpIqNJ5ianF.nqd1wy.pTMdcvrRWxyiGL2eMz.2a85.",
+        "$2b$05$/OK.fbVrR/bpIqNJ5ianF.CE5elHaaO4EbggVDjb8P19RukzXSM3e",
+    ),
     // The moved #33's correct sibling is positive #33.
-    (b"\xff\xa334\xff\xff\xff\xa3345", "$2a$05$/OK.fbVrR/bpIqNJ5ianF.ZC1JEJ8Z4gPfpe1JOr/oyPXTWl9EFd.", "$2y$05$/OK.fbVrR/bpIqNJ5ianF.o./n25XVfn6oAPaUvHe.Csk4zRfsYPi"),
+    (
+        b"\xff\xa334\xff\xff\xff\xa3345",
+        "$2a$05$/OK.fbVrR/bpIqNJ5ianF.ZC1JEJ8Z4gPfpe1JOr/oyPXTWl9EFd.",
+        "$2y$05$/OK.fbVrR/bpIqNJ5ianF.o./n25XVfn6oAPaUvHe.Csk4zRfsYPi",
+    ),
 ];
 
 /// The version marker of a hash string. `HashParts` deliberately does not
@@ -353,10 +392,7 @@ fn invalid_settings_are_rejected() {
             s.parse::<HashParts>().is_err(),
             "{s} must be rejected by HashParts::from_str"
         );
-        assert!(
-            verify(b"pw", s).is_err(),
-            "{s} must be rejected by verify"
-        );
+        assert!(verify(b"pw", s).is_err(), "{s} must be rejected by verify");
     }
 
     // Cost arguments outside 4..=31 are rejected before any hashing happens
@@ -401,8 +437,14 @@ fn edge_case_passwords() {
     let high = b"ab\xffcd";
     let h_high = hash_with_salt(high, 5, salt).expect("cost 5 is valid");
     assert!(verify(high, &h_high.format_for_version(Version::TwoB)).expect("hash parses"));
-    assert_ne!(h_high, hash_with_salt(b"ab\x00cd", 5, salt).expect("cost 5 is valid"));
-    assert_ne!(h_high, hash_with_salt(b"abcd", 5, salt).expect("cost 5 is valid"));
+    assert_ne!(
+        h_high,
+        hash_with_salt(b"ab\x00cd", 5, salt).expect("cost 5 is valid")
+    );
+    assert_ne!(
+        h_high,
+        hash_with_salt(b"abcd", 5, salt).expect("cost 5 is valid")
+    );
 
     // 100-byte password: silently truncated to 72 bytes — the pyca
     // truncation vector (#36) pins the exact string, and 100 == 72 but

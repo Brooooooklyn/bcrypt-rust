@@ -101,7 +101,11 @@ fn batch_corpus() -> (Vec<Vec<u8>>, Vec<[u8; 16]>) {
 /// differential tests apply. This is what discharges the unsafe contract of
 /// `bcrypt_many_with_backend` below.
 fn runnable_backends() -> Vec<Backend> {
-    Backend::ALL.iter().copied().filter(|b| b.is_available()).collect()
+    Backend::ALL
+        .iter()
+        .copied()
+        .filter(|b| b.is_available())
+        .collect()
 }
 
 /// Slow arms (cost 12: a 16-item batch is one to four seconds of work per

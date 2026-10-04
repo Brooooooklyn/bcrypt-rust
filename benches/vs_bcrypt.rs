@@ -228,8 +228,9 @@ fn bench_verify(c: &mut Criterion) {
     let mut group = c.benchmark_group("verify");
     group.bench_function(BenchmarkId::new("cost4", "bcrypt"), |b| {
         b.iter(|| {
-            black_box(bcrypt::verify(black_box(PWD), black_box(hash_string.as_str()))
-                .expect("verify"));
+            black_box(
+                bcrypt::verify(black_box(PWD), black_box(hash_string.as_str())).expect("verify"),
+            );
         });
     });
     group.bench_function(BenchmarkId::new("cost4", "bcrypt_rust"), |b| {

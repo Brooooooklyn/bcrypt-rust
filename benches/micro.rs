@@ -62,14 +62,18 @@ fn usage_exit(msg: &str) -> ! {
     if !msg.is_empty() {
         eprintln!("micro: {msg}");
     }
-    eprintln!(
-        "usage: micro [--backend NAME|all] [--batch N] [--cost C] [--iters K] [--vs-scalar]"
-    );
+    eprintln!("usage: micro [--backend NAME|all] [--batch N] [--cost C] [--iters K] [--vs-scalar]");
     std::process::exit(2)
 }
 
 fn parse_args() -> Args {
-    let mut out = Args { backend: None, batch: 64, cost: 5, iters: None, vs_scalar: false };
+    let mut out = Args {
+        backend: None,
+        batch: 64,
+        cost: 5,
+        iters: None,
+        vs_scalar: false,
+    };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -92,14 +96,21 @@ fn parse_args() -> Args {
         match flag.as_str() {
             "--backend" => out.backend = Some(value(&mut i)),
             "--batch" => {
-                out.batch = value(&mut i).parse().unwrap_or_else(|_| usage_exit("bad --batch"));
+                out.batch = value(&mut i)
+                    .parse()
+                    .unwrap_or_else(|_| usage_exit("bad --batch"));
             }
             "--cost" => {
-                out.cost = value(&mut i).parse().unwrap_or_else(|_| usage_exit("bad --cost"));
+                out.cost = value(&mut i)
+                    .parse()
+                    .unwrap_or_else(|_| usage_exit("bad --cost"));
             }
             "--iters" => {
-                out.iters =
-                    Some(value(&mut i).parse().unwrap_or_else(|_| usage_exit("bad --iters")));
+                out.iters = Some(
+                    value(&mut i)
+                        .parse()
+                        .unwrap_or_else(|_| usage_exit("bad --iters")),
+                );
             }
             "--vs-scalar" => out.vs_scalar = true,
             // Cargo itself appends `--bench` when it runs a harness=false
@@ -124,7 +135,11 @@ fn find_backend(name: &str) -> Backend {
         .copied()
         .find(|b| b.name() == name)
         .unwrap_or_else(|| {
-            let valid = Backend::ALL.iter().map(|b| b.name()).collect::<Vec<_>>().join(", ");
+            let valid = Backend::ALL
+                .iter()
+                .map(|b| b.name())
+                .collect::<Vec<_>>()
+                .join(", ");
             usage_exit(&format!("unknown backend {name} (valid: {valid}, or all)"))
         })
 }
@@ -211,7 +226,10 @@ fn main() {
     let mut scalar_hps = None;
     for &backend in &selected {
         if !backend.is_available() {
-            println!("backend {} not available on this host, skipping", backend.name());
+            println!(
+                "backend {} not available on this host, skipping",
+                backend.name()
+            );
             continue;
         }
         let iters = match args.iters {
@@ -220,7 +238,11 @@ fn main() {
         };
         let start = Instant::now();
         for _ in 0..iters {
-            gate(backend, run(backend, args.cost, &passwords, &salts), &reference);
+            gate(
+                backend,
+                run(backend, args.cost, &passwords, &salts),
+                &reference,
+            );
         }
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_secs_f64() * 1e3;

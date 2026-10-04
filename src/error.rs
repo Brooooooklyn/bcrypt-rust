@@ -131,10 +131,7 @@ mod tests {
             .to_string(),
             "batch length mismatch: 3 passwords but 2 salts"
         );
-        assert_eq!(
-            EntropyError::new(Some(1)).code(),
-            Some(1)
-        );
+        assert_eq!(EntropyError::new(Some(1)).code(), Some(1));
         assert!(EntropyError::new(None).to_string().contains("failed"));
     }
 }

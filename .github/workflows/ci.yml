@@ -168,6 +168,61 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
           BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
 
+  fmt:
+    name: fmt (rustfmt --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: lint (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Two native legs: the x86_64 and aarch64 kernels are cfg'd out on
+          # the other's host, and this crate's lint bar is `-D warnings`.
+          - name: clippy x86_64 linux
+            os: ubuntu-latest
+            targets: ""
+            wasm: false
+          - name: clippy aarch64 macOS
+            os: macos-latest
+            targets: ""
+            wasm: false
+          # The wasm128 modules compile nowhere else; criterion benches do
+          # not build for wasi, so this leg is --lib only.
+          - name: clippy wasm32 simd128
+            os: ubuntu-latest
+            targets: wasm32-wasip1
+            wasm: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+      # --release is deliberate: the x86-64 width/flavor shootout code is
+      # cfg'd INTO release builds (not(debug_assertions)), so only release
+      # clippy sees it — its undocumented-unsafe blocks escaped a debug-only
+      # lint run once already.
+      - if: ${{ !matrix.wasm }}
+        run: cargo clippy --release --all-targets -- -D warnings
+      - if: ${{ !matrix.wasm }}
+        run: cargo clippy --release --all-targets --all-features -- -D warnings
+      - if: ${{ !matrix.wasm }}
+        run: cargo clippy --release --lib --no-default-features -- -D warnings
+      - if: ${{ matrix.wasm }}
+        run: cargo clippy --release --lib --target wasm32-wasip1 -- -D warnings
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
+
   no-std:
     name: no_std build (thumbv7em-none-eabi)
     runs-on: ubuntu-latest
@@ -466,6 +521,8 @@ jobs:
       - test
       - windows
       - macos-x64
+      - fmt
+      - lint
       - no-std
       - docs
       - msrv

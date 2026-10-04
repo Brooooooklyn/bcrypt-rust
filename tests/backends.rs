@@ -89,7 +89,9 @@ fn required_backend() -> Option<Backend> {
         .iter()
         .copied()
         .find(|b| b.name() == name.as_str())
-        .unwrap_or_else(|| panic!("BCRYPT_REQUIRE_BACKEND={name}: unknown backend (valid: {valid})"));
+        .unwrap_or_else(|| {
+            panic!("BCRYPT_REQUIRE_BACKEND={name}: unknown backend (valid: {valid})")
+        });
     assert!(
         backend.is_available(),
         "BCRYPT_REQUIRE_BACKEND={name} but {name} is not available on this host"
@@ -113,7 +115,8 @@ fn run_cross_backend(cost: u32, passwords: &[&[u8]], salts: &[[u8; 16]]) -> Vec<
         let got = unsafe { bcrypt_many_with_backend(backend, cost, passwords, salts) }
             .expect("batch failed");
         assert_eq!(
-            got, reference,
+            got,
+            reference,
             "backend {backend} diverged from scalar at cost {cost} ({} passwords)",
             passwords.len()
         );
@@ -215,9 +218,8 @@ fn openbsd_vectors_across_backends() {
     // The reference is pinned to the vectors' own 23-byte payloads, so this
     // test fails if scalar itself ever regresses, not just on divergence.
     // SAFETY: Scalar is available on every host.
-    let reference =
-        unsafe { bcrypt_many_with_backend(Backend::Scalar, 5, &passwords, &salts) }
-            .expect("scalar batch failed");
+    let reference = unsafe { bcrypt_many_with_backend(Backend::Scalar, 5, &passwords, &salts) }
+        .expect("scalar batch failed");
     assert_eq!(&reference[0][..23], &parts_empty.get_hash()[..]);
     assert_eq!(&reference[1][..23], &parts_u_u.get_hash()[..]);
 
