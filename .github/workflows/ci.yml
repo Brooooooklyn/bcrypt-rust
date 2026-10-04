@@ -80,13 +80,15 @@ jobs:
 
   windows:
     name: build + tests (windows ${{ matrix.arch }})
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
             target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            require: ""
           # 32-bit matters for more than coverage arithmetic: on x86 Windows
           # `extern "system"` is `__stdcall` and decorates the symbol, so an FFI
           # declaration that is merely `extern "C"` links fine on x86_64 and
@@ -96,6 +98,15 @@ jobs:
           # does natively.
           - arch: i686
             target: i686-pc-windows-msvc
+            runner: windows-latest
+            require: ""
+          # windows-11-arm is the GitHub-hosted Windows aarch64 runner. NEON
+          # is architecturally guaranteed on aarch64, so the backends suite
+          # must execute it, never silently skip.
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            require: neon
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -109,6 +120,53 @@ jobs:
       # `vectors` is what actually *calls* ProcessPrng (via `hash`). Without a
       # call the import is never resolved and the ABI would go untested.
       - run: cargo test --release --target ${{ matrix.target }} --test vectors
+      # Cross-backend equality on the SIMD kernels. i686 stays minimal (WOW64
+      # coverage is about the ABI, not dispatch). aarch64 requires NEON; the
+      # x86_64 runner lottery varies, so there the suite runs whatever the CPU
+      # advertises rather than failing on a name.
+      - name: backends suite (required backend)
+        if: ${{ matrix.require != '' }}
+        env:
+          BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
+        run: cargo test --release --target ${{ matrix.target }} --test backends
+      - name: backends suite (best available)
+        if: ${{ matrix.arch == 'x86_64' }}
+        run: cargo test --release --target ${{ matrix.target }} --test backends
+
+  # macOS x86_64 has no hosted runner anymore, so this leg rides Rosetta 2 on
+  # the arm64 image. Rosetta EXECUTES AVX2 but only advertises up to SSE4.2 in
+  # cpuid: the plain leg exercises the SSE4.1 dispatch pick, and the +avx2 leg
+  # compiles the probe to true so the AVX2 kernels (and the base64 decode
+  # pick) execute translated. Byte-exactness is the gate — the backends suite
+  # asserts it; throughput under translation means nothing. The differential
+  # is excluded (its C harness would build for the wrong arch).
+  macos-x64:
+    name: macos x86_64 (Rosetta, ${{ matrix.name }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: sse41 dispatch
+            rustflags: ""
+            require: sse41
+          - name: +avx2
+            rustflags: -C target-feature=+avx2
+            require: avx2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      # Preinstalled on the hosted images; cheap insurance if an image drops it.
+      - name: ensure Rosetta
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+      - name: cargo test (release)
+        run: cargo test --release --target x86_64-apple-darwin --lib --test vectors --test backends
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          BCRYPT_REQUIRE_BACKEND: ${{ matrix.require }}
 
   no-std:
     name: no_std build (thumbv7em-none-eabi)
@@ -407,6 +465,7 @@ jobs:
     needs:
       - test
       - windows
+      - macos-x64
       - no-std
       - docs
       - msrv

@@ -1,5 +1,7 @@
 # bcrypt-rust
 
+[![CI](https://github.com/Brooooooklyn/bcrypt-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Brooooooklyn/bcrypt-rust/actions/workflows/ci.yml)
+
 Pure-Rust [bcrypt](https://www.usenix.org/legacy/events/usenix99/provos/provos.pdf)
 (Provos & Mazières, USENIX 1999) with runtime-dispatched SIMD backends for
 **batch** hashing. **Zero dependencies**, `#![no_std]`-capable, MSRV 1.89.
