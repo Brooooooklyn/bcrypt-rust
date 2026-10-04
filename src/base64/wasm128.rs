@@ -27,18 +27,22 @@
 //! order. Packing (decode) is the mirror image on 32-bit lanes: six
 //! shift/mask terms per dword, then a compaction shuffle.
 //!
-//! Value <-> char translation is compare-and-select, not a LUT:
-//! `i8x16_swizzle` is only a 16-entry table, so range compares plus
-//! `v128_bitselect` are both smaller and branch-free. wasm byte
-//! compares are SIGNED: encode biases values by 0x80 before threshold
-//! tests, and decode compares ASCII directly — every alphabet range
-//! sits inside 0..=127, so bytes >= 0x80 read as negative and fail
-//! every lower bound, which is exactly the scalar reject set.
+//! Value <-> char translation differs by direction. Encode keeps
+//! compare-and-select: `i8x16_swizzle` is only a 16-entry table, too
+//! small for 64 values, so range compares plus `v128_bitselect` are
+//! both smaller and branch-free — wasm byte compares are SIGNED, hence
+//! the 0x80 bias before the threshold tests. Decode classifies with
+//! the escape-simd nibble LUT instead (see [`LO_TAB`]): two swizzle
+//! lookups plus an AND replace the twelve compares, and a third
+//! swizzle folds char -> value translation into the offset add. High
+//! bytes (0x80 and up) land in high-nibble rows 8..15, whose table
+//! entries are 0, so they are invalid via the table — exactly the
+//! scalar reject set.
 
 use core::arch::wasm32::{
-    i16x8_shl, i16x8_splat, i32x4_shl, i32x4_splat, i8x16_add, i8x16_ge, i8x16_gt, i8x16_le,
-    i8x16_shuffle, i8x16_splat, i8x16_sub, u16x8_shr, u32x4_shr, v128, v128_and, v128_any_true,
-    v128_bitselect, v128_load, v128_not, v128_or, v128_store, v128_xor,
+    i8x16_add, i8x16_eq, i8x16_gt, i8x16_shuffle, i8x16_splat, i8x16_swizzle, i16x8_shl,
+    i16x8_splat, i32x4_shl, i32x4_splat, u8x16_shr, u16x8_shr, u32x4_shr, v128, v128_and,
+    v128_any_true, v128_bitselect, v128_load, v128_or, v128_store, v128_xor,
 };
 
 use super::{HASH_B64_LEN, SALT_B64_LEN};
@@ -163,47 +167,54 @@ pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
     out
 }
 
+/// Decode classification tables, keyed by byte nibble (`lo = c & 0x0F`,
+/// `hi = c >> 4`). Each alphabet row owns a bit in the high-nibble
+/// index: row 2 = `./` is 0x01, 3 = `0-9` is 0x02, 4 = `A-O` is 0x04,
+/// 5 = `P-Z` is 0x08, 6 = `a-o` is 0x10, 7 = `p-z` is 0x20.
+/// `LO_TAB[l]` ORs the bits of every row r whose char (r<<4 | l) is in
+/// the alphabet — l=0: '0','P','p' -> 0x2A; l=1..=9: rows 3..=7 ->
+/// 0x3E; l=A: 'J','Z','j','z' -> 0x3C; l=B..=D: rows 4,6 -> 0x14;
+/// l=E: '.','N','n' -> 0x15; l=F: '/','O','o' -> 0x15 — so
+/// `LO_TAB[lo] & HI_TAB[hi]` is nonzero iff the byte is in the
+/// alphabet. Rows 0,1 and 8..15 hold 0, so control bytes and bytes
+/// >= 0x80 are invalid via the table, no sign trickery involved.
+static LO_TAB: [u8; 16] = [
+    0x2A, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3C, 0x14, 0x14, 0x14, 0x15, 0x15,
+];
+/// The row bit of each high nibble; see [`LO_TAB`].
+static HI_TAB: [u8; 16] = [
+    0x00, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+/// Wrapping char -> 6-bit offset per high-nibble row: the u8 views of
+/// 0 - 0x2E (row 2), 54 - 0x30 (row 3), 2 - 0x41 (rows 4,5) and
+/// 28 - 0x61 (rows 6,7). Invalid rows are don't-care 0 — those lanes
+/// are rejected before their value is ever read.
+static OFF_TAB: [u8; 16] = [0, 0, 210, 6, 193, 193, 187, 187, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// Validate and translate one 16-char vector to 6-bit values, then pack
 /// each 4-value dword into 3 bytes. Returns the packed vector (12 real
 /// bytes plus 4 filler bytes from the compaction shuffle) and a mask
 /// that is all-ones in every lane holding a non-alphabet byte.
 #[inline(always)]
 fn decode_block(chars: v128) -> (v128, v128) {
-    // All four ranges sit inside 0..=127, so a byte >= 0x80 is negative
-    // to the signed compares and fails every lower bound — invalid,
-    // exactly as the scalar table says.
-    let dot = v128_and(
-        i8x16_ge(chars, i8x16_splat(b'.' as i8)),
-        i8x16_le(chars, i8x16_splat(b'/' as i8)),
-    );
-    let digit = v128_and(
-        i8x16_ge(chars, i8x16_splat(b'0' as i8)),
-        i8x16_le(chars, i8x16_splat(b'9' as i8)),
-    );
-    let upper = v128_and(
-        i8x16_ge(chars, i8x16_splat(b'A' as i8)),
-        i8x16_le(chars, i8x16_splat(b'Z' as i8)),
-    );
-    let lower = v128_and(
-        i8x16_ge(chars, i8x16_splat(b'a' as i8)),
-        i8x16_le(chars, i8x16_splat(b'z' as i8)),
-    );
-    let valid = v128_or(v128_or(dot, digit), v128_or(upper, lower));
-    // The masks are disjoint, so any nesting order works; invalid lanes
-    // take a garbage value that the error path never returns.
-    let vals = v128_bitselect(
-        i8x16_sub(chars, i8x16_splat(46)),
-        v128_bitselect(
-            i8x16_add(chars, i8x16_splat(6)),
-            v128_bitselect(
-                i8x16_sub(chars, i8x16_splat(63)),
-                i8x16_sub(chars, i8x16_splat(69)),
-                upper,
-            ),
-            digit,
-        ),
-        dot,
-    );
+    // SAFETY: all three statics are live 16-byte arrays, readable in
+    // full.
+    let (lo_tab, hi_tab, off_tab) = unsafe {
+        (
+            v128_load(LO_TAB.as_ptr().cast::<v128>()),
+            v128_load(HI_TAB.as_ptr().cast::<v128>()),
+            v128_load(OFF_TAB.as_ptr().cast::<v128>()),
+        )
+    };
+    let lo = v128_and(chars, i8x16_splat(0x0f));
+    // Logical shift, so `hi` is 0..=15 by construction — both swizzle
+    // indices stay in range and the out-of-range zeroing never fires.
+    let hi = u8x16_shr(chars, 4);
+    let valid = v128_and(i8x16_swizzle(lo_tab, lo), i8x16_swizzle(hi_tab, hi));
+    // The offset add wraps on invalid lanes — garbage the error path
+    // never returns.
+    let vals = i8x16_add(chars, i8x16_swizzle(off_tab, hi));
+    let bad = i8x16_eq(valid, i8x16_splat(0));
     // Per dword [c0,c1,c2,c3] (LE): B0 = c0<<2 | c1>>4 lands at byte 0,
     // B1 = (c1&0xf)<<4 | c2>>2 at byte 1, B2 = (c2&3)<<6 | c3 at byte 2.
     let b0 = v128_or(
@@ -221,7 +232,7 @@ fn decode_block(chars: v128) -> (v128, v128) {
     let packed = v128_or(v128_or(b0, b1), b2);
     let compact =
         i8x16_shuffle::<0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 16, 16, 16>(packed, packed);
-    (compact, v128_not(valid))
+    (compact, bad)
 }
 
 /// Decode exactly [`SALT_B64_LEN`] chars back to the 16-byte salt.

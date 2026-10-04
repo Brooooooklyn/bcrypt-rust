@@ -12,9 +12,11 @@
 //! bytes 15..22 zero-extended (encode_23), so table indices stay in bounds
 //! while reading past the payload end yields zero. Fields are translated
 //! with one `vqtbl4q_u8` against the 64-entry alphabet. Decode validates
-//! with unsigned range arithmetic on the five alphabet classes and packs
-//! 4x6 -> 3 with the shift/or inverse; bits dropped by the byte shifts are
-//! exactly the spare ones. Overlapping stores land exactly 22/31 chars and
+//! with a nibble-LUT classifier — a class bit per used high nibble ANDed
+//! (`vtstq_u8`) against the low nibble's mask of valid rows — with the
+//! char -> value offset folded into one wrapping add, and packs 4x6 -> 3
+//! with the shift/or inverse; bits dropped by the byte shifts are exactly
+//! the spare ones. Overlapping stores land exactly 22/31 chars and
 //! 16/23 bytes with no scalar tail.
 
 use core::arch::aarch64::*;
@@ -41,6 +43,17 @@ static SHIFT_A: [i8; 16] = [-2, 4, 2, 0, -2, 4, 2, 0, -2, 4, 2, 0, -2, 4, 2, 0];
 static SHIFT_B: [i8; 16] = [0, -4, -6, 0, 0, -4, -6, 0, 0, -4, -6, 0, 0, -4, -6, 0];
 static MASK_A: [u8; 16] = [0x3f, 0x30, 0x3c, 0x3f, 0x3f, 0x30, 0x3c, 0x3f, 0x3f, 0x30, 0x3c, 0x3f, 0x3f, 0x30, 0x3c, 0x3f];
 static MASK_B: [u8; 16] = [0x00, 0x0f, 0x03, 0x00, 0x00, 0x0f, 0x03, 0x00, 0x00, 0x0f, 0x03, 0x00, 0x00, 0x0f, 0x03, 0x00];
+
+// Decode classify: HI_TAB gives each used high nibble a class bit (2 './',
+// 3 '0-9', 4 'A-O', 5 'P-Z', 6 'a-o', 7 'p-z'). LO_TAB[l] ORs the bits of
+// every row r whose char (r<<4 | l) is in the alphabet — l=0: '0','P','p';
+// 1..9: rows 3-7; A: 'J','Z','j','z'; B..D: rows 4,6; E: '.','N','n';
+// F: '/','O','o' — so `vtstq` on the two lookups accepts exactly the
+// scalar set. OFF_TAB is the wrapping addend mapping char -> value
+// (0-0x2E=-46, 54-0x30=6, 2-0x41=-63, 28-0x61=-69; unused rows don't-care).
+static HI_TAB: [u8; 16] = [0x00, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0, 0, 0, 0, 0, 0, 0, 0];
+static LO_TAB: [u8; 16] = [0x2A, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3E, 0x3C, 0x14, 0x14, 0x14, 0x15, 0x15];
+static OFF_TAB: [u8; 16] = [0, 0, 210, 6, 193, 193, 187, 187, 0, 0, 0, 0, 0, 0, 0, 0];
 
 // Decode pack: lanes 3i..3i+2 of the output take the 6-bit values of
 // chars 4i..4i+3; lanes 12..15 are junk that stores never keep.
@@ -112,25 +125,22 @@ pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
     out
 }
 
-/// Char -> 6-bit value plus a validity mask (0xFF lanes), via wrapping
-/// unsigned range checks on the five alphabet classes — the exact scalar
-/// reject set. Classes are disjoint, so the vbsl chain order is free.
+/// Char -> 6-bit value plus a validity mask (0xFF lanes), via the
+/// nibble-LUT classifier above: `vtstq` accepts exactly the lanes where
+/// the high nibble's class bit appears in the low nibble's mask of valid
+/// rows — the exact scalar reject set. The byte shift already bounds `hi`
+/// to 0..=15, so only `lo` is masked. Invalid rows take offset 0: their
+/// values are garbage the reject path never returns.
 fn translate(c: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
-    // SAFETY: NEON is mandatory on aarch64; register-only, no memory.
+    // SAFETY: NEON is mandatory on aarch64; the loads are 16-byte reads of
+    // 16-byte statics, the rest register-only.
     unsafe {
-        let d_punct = vsubq_u8(c, vdupq_n_u8(b'.')); // '.' -> 0, '/' -> 1
-        let d0 = vsubq_u8(c, vdupq_n_u8(b'0'));
-        let da = vsubq_u8(c, vdupq_n_u8(b'A'));
-        let dl = vsubq_u8(c, vdupq_n_u8(b'a'));
-        let m_punct = vcgtq_u8(vdupq_n_u8(2), d_punct);
-        let m_digit = vcgtq_u8(vdupq_n_u8(10), d0);
-        let m_upper = vcgtq_u8(vdupq_n_u8(26), da);
-        let m_lower = vcgtq_u8(vdupq_n_u8(26), dl);
-        let v = vbslq_u8(m_digit, vaddq_u8(d0, vdupq_n_u8(54)), d_punct);
-        let v = vbslq_u8(m_upper, vaddq_u8(da, vdupq_n_u8(2)), v);
-        let v = vbslq_u8(m_lower, vaddq_u8(dl, vdupq_n_u8(28)), v);
-        let m = vorrq_u8(vorrq_u8(m_punct, m_digit), vorrq_u8(m_upper, m_lower));
-        (v, m)
+        let lo = vandq_u8(c, vdupq_n_u8(0x0F));
+        let hi = vshrq_n_u8::<4>(c);
+        let mlo = vqtbl1q_u8(vld1q_u8(LO_TAB.as_ptr()), lo);
+        let mhi = vqtbl1q_u8(vld1q_u8(HI_TAB.as_ptr()), hi);
+        let off = vqtbl1q_u8(vld1q_u8(OFF_TAB.as_ptr()), hi);
+        (vaddq_u8(c, off), vtstq_u8(mlo, mhi))
     }
 }
 
