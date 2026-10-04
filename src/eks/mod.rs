@@ -452,6 +452,8 @@ fn l1d_size() -> Option<usize> {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     // Leaf 4 exists on every CPU the shootout can run on (AVX-512F is
     // decades newer), but a hypervisor could mask it — probe defensively.
+    // SAFETY: cpuid is a read-only, always-available instruction; it is
+    // declared `unsafe fn` only on the MSRV (see the fn-level note).
     if unsafe { __cpuid(0) }.eax < 4 {
         return None;
     }
@@ -459,6 +461,8 @@ fn l1d_size() -> Option<usize> {
     // 16-iteration cap is paranoia against a broken cpuid, never hit in
     // practice (real hierarchies have ≤ 4 entries).
     for sub_leaf in 0..16u32 {
+        // SAFETY: same as above — read-only instruction, unsafe only on
+        // the MSRV toolchain.
         let r = unsafe { __cpuid_count(4, sub_leaf) };
         let cache_type = r.eax & 0x1f;
         if cache_type == 0 {
