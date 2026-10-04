@@ -847,6 +847,9 @@ mod tests {
         }
     }
 
+    // Five cost-4 hashes; Miri interprets one in ~20 s, so this functional
+    // coverage is native-owned (padded_key itself is unit-tested above).
+    #[cfg(not(miri))]
     #[test]
     fn passwords_longer_than_72_bytes_hash_like_their_prefix() {
         let salt = [0x42; 16];
@@ -864,8 +867,13 @@ mod tests {
     #[test]
     fn openbsd_vector_end_to_end() {
         assert_eq!(verify(b"U*U", VECTOR_2A), Ok(true));
-        assert_eq!(verify(b"U*U*", VECTOR_2A), Ok(false));
-        assert_eq!(verify(b"", VECTOR_2A), Ok(false));
+        // Every verify hashes at cost 5 (~40 s under the interpreter):
+        // Miri runs the happy path, natives own the negatives.
+        #[cfg(not(miri))]
+        {
+            assert_eq!(verify(b"U*U*", VECTOR_2A), Ok(false));
+            assert_eq!(verify(b"", VECTOR_2A), Ok(false));
+        }
 
         // The same vector through the hashing side, with the salt decoded
         // out of the string.
@@ -877,6 +885,8 @@ mod tests {
         );
     }
 
+    // Four cost-4 hashes; native-owned (see openbsd_vector_end_to_end).
+    #[cfg(not(miri))]
     #[test]
     fn round_trip_and_wrong_password() {
         let salt = [7u8; 16];
@@ -889,6 +899,8 @@ mod tests {
         assert_eq!(verify(b"", s), Ok(false));
     }
 
+    // Six cost-4 hashes; native-owned (see openbsd_vector_end_to_end).
+    #[cfg(not(miri))]
     #[test]
     fn all_version_markers_verify_the_same() {
         let salt = [3u8; 16];
@@ -938,10 +950,13 @@ mod tests {
     #[test]
     fn non_truncating_variants_reject_72_bytes_and_up() {
         let salt = [5u8; 16];
+        #[cfg(not(miri))]
         let pw71 = [b'a'; 71];
         let pw72 = [b'a'; 72];
         let pw100 = [b'a'; 100];
 
+        // The hashing asserts are native-owned (~20 s each under Miri).
+        #[cfg(not(miri))]
         assert!(non_truncating_hash_with_salt(pw71, 4, salt).is_ok());
         assert_eq!(
             non_truncating_hash_with_salt(pw72, 4, salt),
@@ -966,9 +981,12 @@ mod tests {
         );
 
         // At the boundary the two families agree.
-        let a = hash_with_salt(pw71, 4, salt).expect("valid cost");
-        let b = non_truncating_hash_with_salt(pw71, 4, salt).expect("71 bytes pass");
-        assert_eq!(a, b);
+        #[cfg(not(miri))]
+        {
+            let a = hash_with_salt(pw71, 4, salt).expect("valid cost");
+            let b = non_truncating_hash_with_salt(pw71, 4, salt).expect("71 bytes pass");
+            assert_eq!(a, b);
+        }
     }
 
     #[test]
@@ -994,7 +1012,11 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn bcrypt_many_matches_bcrypt_for_sizes_0_to_17() {
-        for n in 0..=17usize {
+        // 306 cost-4 hashes is instant natively but many minutes under an
+        // interpreter; Miri covers the same dispatch shapes (empty, single,
+        // multi-lane) with sizes 0..=2.
+        let max = if cfg!(miri) { 2 } else { 17 };
+        for n in 0..=max {
             let store: Vec<[u8; 8]> = (0..n)
                 .map(|i| {
                     let mut a = [0xA5u8; 8];
@@ -1050,7 +1072,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "alloc")]
+    // Six cost-4 hashes; native-owned (see openbsd_vector_end_to_end).
+    #[cfg(all(feature = "alloc", not(miri)))]
     #[test]
     fn hash_many_with_salts_round_trip() {
         let pws: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];
@@ -1066,7 +1089,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "alloc")]
+    // Nine hashes across cost 4 and 5; native-owned (see above).
+    #[cfg(all(feature = "alloc", not(miri)))]
     #[test]
     fn verify_many_mixed_costs_with_failures() {
         let parts4 = hash_with_salt(b"correct horse", 4, [1u8; 16]).expect("valid cost");
@@ -1110,7 +1134,8 @@ mod tests {
         assert!(verify_many(&[], &[]).is_empty());
     }
 
-    #[cfg(feature = "std")]
+    // Seven cost-4 hashes; native-owned (see openbsd_vector_end_to_end).
+    #[cfg(all(feature = "std", not(miri)))]
     #[test]
     fn hash_family_with_random_salts() {
         let h = hash(b"hunter2", 4).expect("hashing works");
@@ -1145,7 +1170,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "std")]
+    // Six cost-4 hashes; native-owned (see openbsd_vector_end_to_end).
+    #[cfg(all(feature = "std", not(miri)))]
     #[test]
     fn hash_many_round_trip() {
         let pws: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];

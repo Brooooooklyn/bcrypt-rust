@@ -770,6 +770,13 @@ mod tests {
 
     #[test]
     fn detection_respects_the_architecture() {
+        if cfg!(miri) {
+            // Detection is compile-time pinned to Scalar under Miri (the
+            // interpreter implements no SIMD intrinsics); the pin itself
+            // is what there is to check there.
+            assert_eq!(detect(), Backend::Scalar);
+            return;
+        }
         if cfg!(target_arch = "aarch64") {
             assert!(!have_sse41());
             assert!(!have_avx2());
@@ -809,8 +816,11 @@ mod tests {
     fn every_backend_resolves_to_a_function() {
         for &b in Backend::ALL {
             let f = bcrypt_lanes_fn(b);
-            let scalar = bcrypt_lanes_fn(Backend::Scalar);
-            if b == Backend::Scalar {
+            // Function pointers may compare unequal even for the same
+            // function, and Miri exercises that freedom — the identity
+            // check is native-only; under Miri, resolving must not panic.
+            if b == Backend::Scalar && !cfg!(miri) {
+                let scalar = bcrypt_lanes_fn(Backend::Scalar);
                 assert!(core::ptr::fn_addr_eq(f, scalar));
             }
         }

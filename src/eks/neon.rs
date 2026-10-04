@@ -521,6 +521,10 @@ mod tests {
     /// Different passwords and different salts, one per lane, must
     /// reproduce `LANES` scalar hashes bit for bit — including the
     /// OpenBSD `U*U` vector in lane 1.
+    // Miri cannot interpret NEON intrinsics; production paths never reach
+    // this kernel under Miri (detect pins Scalar), only this direct test
+    // would.
+    #[cfg(not(miri))]
     #[test]
     fn lanes_match_scalar() {
         let vector_salt =

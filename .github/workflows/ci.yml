@@ -435,7 +435,7 @@ jobs:
   miri:
     name: miri
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -444,7 +444,14 @@ jobs:
       # Scoped to --lib on purpose: the unit tests exercise the unsafe wipe
       # and the scalar kernel at Miri-feasible costs. The integration suites
       # hash at cost 12 (hours under an interpreter) and the SIMD modules use
-      # intrinsics Miri does not implement.
+      # intrinsics Miri does not implement — every dispatch arm pins to
+      # scalar under cfg(miri), and the exhaustive base64 differential is
+      # cfg(not(miri)) since it would only compare scalar against itself.
+      # One interpreted cost-4 hash takes ~20 s, so hashing tests whose
+      # functional coverage the native jobs already own are cfg(not(miri));
+      # what remains (kernel vectors, lanes and batch entries, wipe,
+      # encoding, base64 units) is the UB-hunting set — ~7 min on a
+      # developer machine, well inside the timeout on the hosted runner.
       - name: cargo miri test
         run: cargo miri test --release --lib
 

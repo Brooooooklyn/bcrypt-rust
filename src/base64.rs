@@ -17,7 +17,8 @@
 //! feature is mandatory on the target), x86_64 picks AVX2 then SSSE3 at
 //! runtime on `std` builds (compile-time `target_feature` cfgs otherwise),
 //! wasm32 runs the v128 kernel under `simd128`, and everything else runs
-//! the scalar tables. Every path is byte-exact
+//! the scalar tables. Under Miri every arm pins to scalar — the
+//! interpreter implements no SIMD intrinsics. Every path is byte-exact
 //! identical, reject set included — the differential tests below pin that.
 //! Measured share of one hash: ~20 ns against 163 µs at cost 4 (0.012%),
 //! so this is completeness of the SIMD story, not a throughput play.
@@ -61,7 +62,7 @@ pub(crate) mod wasm128;
 
 /// Encode a 16-byte salt to its 22-char bcrypt base64 form.
 pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     return neon::encode_16(bytes);
     #[cfg(target_arch = "x86_64")]
     return x86::encode_16(bytes);
@@ -73,7 +74,7 @@ pub(crate) fn encode_16(bytes: &[u8; 16]) -> [u8; SALT_B64_LEN] {
 
 /// Encode the 23 hash bytes to their 31-char bcrypt base64 form.
 pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     return neon::encode_23(bytes);
     #[cfg(target_arch = "x86_64")]
     return x86::encode_23(bytes);
@@ -85,7 +86,7 @@ pub(crate) fn encode_23(bytes: &[u8; 23]) -> [u8; HASH_B64_LEN] {
 
 /// Decode exactly [`SALT_B64_LEN`] chars back to the 16-byte salt.
 pub(crate) fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     return neon::decode_16(s);
     #[cfg(target_arch = "x86_64")]
     return x86::decode_16(s);
@@ -97,7 +98,7 @@ pub(crate) fn decode_16(s: &[u8]) -> Result<[u8; 16], ()> {
 
 /// Decode exactly [`HASH_B64_LEN`] chars back to the 23 hash bytes.
 pub(crate) fn decode_23(s: &[u8]) -> Result<[u8; 23], ()> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     return neon::decode_23(s);
     #[cfg(target_arch = "x86_64")]
     return x86::decode_23(s);
@@ -193,6 +194,10 @@ mod tests {
     /// The dispatched path (SIMD where compiled) must be byte-exact against
     /// the scalar tables — outputs AND the reject set. Exhaustive over every
     /// byte value at every position, plus random whole-string round-trips.
+    /// Skipped under Miri: the SIMD arms pin to scalar there (x86 probes
+    /// answer false, the aarch64 arm is cfg'd out), so the sweep would
+    /// compare scalar against itself at interpreter speed.
+    #[cfg(not(miri))]
     #[test]
     fn dispatch_matches_scalar() {
         let mut rng = Rng(0xB529_7A4D_1D2B_9F83);
