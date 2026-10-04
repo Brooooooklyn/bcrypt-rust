@@ -66,9 +66,12 @@
 //! A third arm joins the shootout only where the cache geometry allows:
 //! [`Backend::Avx2x12`], twelve AVX2 lanes (eight ymm + four xmm) whose
 //! 48 KiB working set is exactly the L1d of Zen 5, Ice Lake and later Intel
-//! cores. [`l1d_size`] probes cpuid leaf 4 and admits the arm at ≥ 48 KiB;
-//! the AVX-512F gate above costs nothing because every 48 KiB-L1d x86 chip
-//! also ships AVX-512. The arm is picked only on a strict timed win — ties
+//! cores. [`l1d_size`] probes cpuid leaf 4 and admits the arm at ≥ 48 KiB.
+//! The shootout itself is reached only from [`detect`]'s AVX-512F arm, so
+//! AVX2-only 48 KiB-L1d hosts — Alder/Raptor Lake client cores, where
+//! AVX-512 is fused off — never measure the 12-lane arm; whether it would
+//! win there is unmeasured (no such hardware in the lab). The arm is picked
+//! only on a strict timed win — ties
 //! keep the wider incumbent (`avx512 > avx2 > avx2x12`) — and the 12-lane
 //! kernel is never in the static fallback order.
 //!
@@ -249,7 +252,7 @@ impl Backend {
             // The kernel is plain AVX2 code: any AVX2 CPU executes it
             // correctly. The 48 KiB-L1d gate is a *selection* rule (the
             // width shootout), not an availability rule — a forced
-            // `BCRYPT_REQUIRE_BACKEND=avx2_12` must run anywhere AVX2 does.
+            // `BCRYPT_FORCE_BACKEND=avx2_12` must run anywhere AVX2 does.
             Backend::Avx2x12 => have_avx2(),
             Backend::Wasm128 => have_wasm_simd128(),
         }
@@ -538,9 +541,11 @@ fn l1d_size() -> Option<usize> {
 /// docs); it needs AVX2 as the alternative, and without it the static order
 /// stands. Reached only from [`detect`]'s `have_avx512f()` arm, so AVX-512F
 /// is known available here — which is also why the shootout's
-/// [`Backend::Avx2x12`] arm needs no AVX-512 probe of its own: every
-/// 48 KiB-L1d x86 chip advertises AVX-512F, so the arm's absence on
-/// AVX2-only hosts costs nothing.
+/// [`Backend::Avx2x12`] arm needs no AVX-512 probe of its own. The flip
+/// side: AVX2-only 48 KiB-L1d hosts (Alder/Raptor Lake client cores, where
+/// AVX-512 is fused off) never enter this function, so the 12-lane arm is
+/// never measured there; admitting it would take an AVX2-only shootout
+/// arm, and whether it would win is unmeasured.
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
 fn width_pick() -> Backend {
     if !have_avx2() {

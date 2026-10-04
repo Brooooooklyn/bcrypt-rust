@@ -129,7 +129,10 @@
 //! No fallible public path panics: hashing, verifying, parsing and batch
 //! length validation all report failure as a [`BcryptError`].
 //! [`verify_many`] returns per-item `Result`s precisely so that one
-//! malformed string in a batch stays a value, not a panic.
+//! malformed string in a batch stays a value, not a panic. The one carve-out
+//! is opt-in: an unknown or unavailable `BCRYPT_FORCE_BACKEND` value panics
+//! on the first dispatched batch call, by design (see the `eks` module
+//! docs).
 
 #![no_std]
 #![warn(missing_docs)]

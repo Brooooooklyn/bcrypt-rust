@@ -27,10 +27,11 @@
 //! other arms, and picks it only on a strict timed win. Our lab has no
 //! 48 KiB-L1d x86 hardware (Zen 5 / Ice Lake+), so **no performance win
 //! is claimed**: correctness is force-verified
-//! (`BCRYPT_REQUIRE_BACKEND=avx2_12`) on Zen 4 — where its 32 KiB L1d
-//! keeps the gate OFF, making the forced run the kernel's execution
-//! evidence — and under Rosetta 2, and the kernel only ever runs where
-//! the measured shootout picks it.
+//! (`BCRYPT_FORCE_BACKEND=avx2_12`, or `BCRYPT_REQUIRE_BACKEND` in the
+//! test harness) on Zen 4 — where its 32 KiB L1d keeps the gate OFF,
+//! making the forced run the kernel's execution evidence — and under
+//! Rosetta 2, and the kernel only ever runs where the measured shootout
+//! picks it.
 //!
 //! # State layout: two SoA halves
 //!
@@ -69,7 +70,7 @@
 //! # Rosetta note
 //!
 //! Under Rosetta 2 with `RUSTFLAGS="-C target-feature=+avx2"` the kernel
-//! executes translated when forced (`BCRYPT_REQUIRE_BACKEND=avx2_12`);
+//! executes translated when forced (`BCRYPT_FORCE_BACKEND=avx2_12`);
 //! Rosetta never advertises AVX-512, so detection never reaches the width
 //! shootout that would self-select it. Correctness is the gate under
 //! Rosetta, not speed.

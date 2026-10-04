@@ -605,6 +605,12 @@ pub fn bcrypt_many(
     salts: &[[u8; 16]],
 ) -> BcryptResult<Vec<[u8; 24]>> {
     check_batch(cost, passwords, salts)?;
+    if passwords.is_empty() {
+        // Return before `backend()` is evaluated: on a cold process an
+        // empty batch would otherwise pay the one-time width shootout
+        // (~0.4 s on AVX-512 hosts) to hash nothing.
+        return Ok(Vec::new());
+    }
     let (mut key_words, salt_words) = prep_words(passwords, salts);
     let mut outs = alloc::vec![[0u8; 24]; passwords.len()];
     // SAFETY: `crate::eks::backend()` only ever names a backend this CPU
