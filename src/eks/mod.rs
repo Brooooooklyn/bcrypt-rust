@@ -27,9 +27,10 @@
 //! * Detection runs at most once per process. The result is cached in a
 //!   [`AtomicU8`] read with [`Ordering::Relaxed`]. The initialisation race is
 //!   benign: every thread computes the same answer, so a duplicated `detect()`
-//!   only wastes a `cpuid`. (The one exception: the width shootout below can
-//!   make a racing duplicate *measure* twice; the cache is single-assignment,
-//!   so all threads still settle on one pick.)
+//!   only wastes a `cpuid`. The one expensive decision — the width shootout,
+//!   when it applies — is single-flight behind a `OnceLock`: racing cold
+//!   callers park until the winner publishes instead of each duplicating the
+//!   ~0.4 s measurement and timing it under self-inflicted contention.
 //! * A batch call resolves the function pointer **once**, before chunking into
 //!   lane-width groups (see `crate::core`). Nothing dispatches inside the
 //!   per-group loop.
@@ -67,13 +68,18 @@
 //! [`Backend::Avx2x12`], twelve AVX2 lanes (eight ymm + four xmm) whose
 //! 48 KiB working set is exactly the L1d of Zen 5, Ice Lake and later Intel
 //! cores. [`l1d_size`] probes cpuid leaf 4 and admits the arm at ≥ 48 KiB.
-//! The shootout itself is reached only from [`detect`]'s AVX-512F arm, so
-//! AVX2-only 48 KiB-L1d hosts — Alder/Raptor Lake client cores, where
-//! AVX-512 is fused off — never measure the 12-lane arm; whether it would
-//! win there is unmeasured (no such hardware in the lab). The arm is picked
-//! only on a strict timed win — ties
-//! keep the wider incumbent (`avx512 > avx2 > avx2x12`) — and the 12-lane
-//! kernel is never in the static fallback order.
+//! The candidate set is built from independent capabilities — `Avx512` when
+//! advertised, `Avx2` always, `Avx2x12` when the gate holds — so AVX2-only
+//! 48 KiB-L1d hosts (Alder/Raptor Lake client cores, where AVX-512 is fused
+//! off, and the homogeneous Xeon E-2400) measure the 12-lane arm too; with
+//! a single candidate (plain AVX2 hosts) no clock is spent at all. The arm
+//! is picked only on a strict timed win — ties keep the wider incumbent
+//! (`avx512 > avx2 > avx2x12`) — and the 12-lane kernel is never in the
+//! static fallback order. One caveat for hybrid parts: leaf 4 is
+//! per-logical-processor while the pick is process-global, so a pick
+//! measured on a P-core can later run on an E-core's 32 KiB L1d — a
+//! bounded, batch-only regression class that the AVX2 gather-flavor pick
+//! already has there (and detection running on an E-core fails closed).
 //!
 //! # `no_std`
 //!
@@ -408,12 +414,11 @@ pub fn detect() -> Backend {
     if let Some(forced) = forced_backend() {
         return forced;
     }
-    if have_avx512f() {
-        // Both x86-64 SIMD widths exist; which is faster is a µarch
-        // question the width shootout answers where it can (module docs).
+    if have_avx512f() || have_avx2() {
+        // Which widths exist, and which actually wins, is a µarch question
+        // the width shootout answers where it can (module docs); a single
+        // candidate spends no clock.
         width_pick()
-    } else if have_avx2() {
-        Backend::Avx2
     } else if have_sse41() {
         Backend::Sse41
     } else if have_neon() {
@@ -486,12 +491,14 @@ pub fn backend() -> Backend {
 // non-Miri only)
 // ---------------------------------------------------------------------------
 
-/// Cached width-shootout winner as a `u8`, or [`UNINIT`] — the same sentinel
-/// protocol as [`CACHED_BACKEND`]. Only ever holds [`Backend::Avx2`],
-/// [`Backend::Avx512`] or [`Backend::Avx2x12`]; single-assignment (see
-/// [`width_shootout_and_cache`]).
+/// The measured width-shootout winner as a `u8`. `OnceLock::get_or_init`
+/// makes the pick single-flight: racing cold callers park until the winner
+/// publishes, so the ~0.4 s measurement runs at most once per process and
+/// never under self-inflicted contention (which could stick the process
+/// with the wrong pick). Only ever holds [`Backend::Avx2`],
+/// [`Backend::Avx512`] or [`Backend::Avx2x12`].
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
-static CACHED_WIDTH: AtomicU8 = AtomicU8::new(UNINIT);
+static WIDTH_PICK: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 /// The L1 data cache size in bytes from cpuid leaf 4 (Deterministic Cache
 /// Parameters), or `None` when the leaf describes no L1 data cache. Only
@@ -536,51 +543,40 @@ fn l1d_size() -> Option<usize> {
     None
 }
 
-/// The answer to "AVX-512F advertised": which width actually wins on *this*
-/// CPU. With a clock and optimized code a one-time shootout decides (module
-/// docs); it needs AVX2 as the alternative, and without it the static order
-/// stands. Reached only from [`detect`]'s `have_avx512f()` arm, so AVX-512F
-/// is known available here — which is also why the shootout's
-/// [`Backend::Avx2x12`] arm needs no AVX-512 probe of its own. The flip
-/// side: AVX2-only 48 KiB-L1d hosts (Alder/Raptor Lake client cores, where
-/// AVX-512 is fused off) never enter this function, so the 12-lane arm is
-/// never measured there; admitting it would take an AVX2-only shootout
-/// arm, and whether it would win is unmeasured.
+/// Which x86-64 width actually wins on *this* CPU, measured. The candidate
+/// set is built from independent capabilities — `Avx512` when advertised,
+/// `Avx2` always, [`Backend::Avx2x12`] when the 48 KiB-L1d gate holds (its
+/// kernel is AVX2 code) — so AVX2-only 48 KiB hosts (Alder/Raptor Lake
+/// client, Xeon E-2400) measure the 12-lane arm too. A single candidate
+/// spends no clock at all; two or more run the one-time shootout behind
+/// [`WIDTH_PICK`]'s single-flight init (module docs).
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
 fn width_pick() -> Backend {
-    if !have_avx2() {
+    let avx512 = have_avx512f();
+    let avx2 = have_avx2();
+    let x12 = avx2 && l1d_size().is_some_and(|bytes| bytes >= 48 * 1024);
+    if !avx2 {
+        // No shipping AVX-512F CPU lacks AVX2; keep the static answer.
         return Backend::Avx512;
     }
-    let cached = CACHED_WIDTH.load(Ordering::Relaxed);
-    if cached != UNINIT {
-        return Backend::from_u8(cached);
+    if !avx512 && !x12 {
+        // One candidate — nothing to measure.
+        return Backend::Avx2;
     }
-    width_shootout_and_cache()
+    Backend::from_u8(*WIDTH_PICK.get_or_init(|| width_shootout(avx512, x12).to_u8()))
 }
 
 /// See the measuring variant above. Debug builds, `no_std` and Miri keep the
-/// static AVX-512-first order: timing unoptimized/interpreted intrinsics
-/// measures the codegen mode, not the µarch — and without `std` there is no
-/// clock at all (the flavor shootouts make the same trade).
+/// static order: timing unoptimized/interpreted intrinsics measures the
+/// codegen mode, not the µarch — and without `std` there is no clock at all
+/// (the flavor shootouts make the same trade). The answer still follows
+/// capability, so an AVX2-only host never names a backend it lacks.
 #[cfg(not(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri))))]
 fn width_pick() -> Backend {
-    Backend::Avx512
-}
-
-/// Run the shootout and publish the winner. `compare_exchange` makes the
-/// cache single-assignment: a racing duplicate measures the same class of
-/// answer, but on parity machines two measurements can flip, and every
-/// thread must agree with the value [`detect_and_cache`] may already have
-/// published. First store wins; losers take the established pick.
-#[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
-#[cold]
-#[inline(never)]
-fn width_shootout_and_cache() -> Backend {
-    let picked = width_shootout();
-    match CACHED_WIDTH.compare_exchange(UNINIT, picked.to_u8(), Ordering::Relaxed, Ordering::Relaxed)
-    {
-        Ok(_) => picked,
-        Err(established) => Backend::from_u8(established),
+    if have_avx512f() {
+        Backend::Avx512
+    } else {
+        Backend::Avx2
     }
 }
 
@@ -588,10 +584,11 @@ fn width_shootout_and_cache() -> Backend {
 /// same fixed deterministic 48-password batch at cost 4 — correctness first
 /// (outputs asserted byte-identical across ALL arms; a mismatch is a kernel
 /// bug, not a tie), then three interleaved timed reps each, min per arm.
-/// The arm list is `Avx512` and `Avx2` always, plus [`Backend::Avx2x12`]
-/// where [`l1d_size`] reports at least 48 KiB (its kernel is AVX2 code,
-/// which `width_pick` already proved present). Arms are in tie-preference
-/// order — `avx512 > avx2 > avx2x12` — and an arm must be STRICTLY faster
+/// [`width_pick`] builds the arm list from capabilities: `Avx2` always,
+/// `Avx512` when advertised, [`Backend::Avx2x12`] when the 48 KiB-L1d gate
+/// holds (its kernel is AVX2 code, already proven present). Arms are in
+/// tie-preference order — `avx512 > avx2 > avx2x12` — and an arm must be
+/// STRICTLY faster
 /// than the reigning arm to take the title, so a tie keeps the wider
 /// incumbent and the 12-lane kernel is picked only on an outright win. The
 /// batch is 48 items — six AVX2 groups / three AVX-512 groups / four
@@ -599,7 +596,7 @@ fn width_shootout_and_cache() -> Backend {
 /// distorts any side and every arm hashes the same 48 passwords, making
 /// raw elapsed time a per-hash comparison.
 #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
-fn width_shootout() -> Backend {
+fn width_shootout(has_avx512: bool, has_x12: bool) -> Backend {
     use std::time::Instant;
 
     // SplitMix64, fixed seed: deterministic inputs (not a CSPRNG, nor does
@@ -630,12 +627,12 @@ fn width_shootout() -> Backend {
     ) {
         let mut base = 0;
         while base < ITEMS {
-            // SAFETY: `width_shootout` runs only when AVX2 and AVX-512F
-            // are both advertised (`width_pick`'s gate), and every arm's
-            // kernel targets one of those instruction sets (the AVX2x12
-            // kernel is AVX2 code). `ITEMS` is a multiple of every arm's
-            // lane count, so each group slice is exactly `lanes` long,
-            // and each `outs` group is exclusively owned by this frame.
+            // SAFETY: `width_pick` admitted every arm only when this CPU
+            // advertises its instruction set (the AVX2x12 kernel is AVX2
+            // code, and AVX2 is always present here). `ITEMS` is a multiple
+            // of every arm's lane count, so each group slice is exactly
+            // `lanes` long, and each `outs` group is exclusively owned by
+            // this frame.
             unsafe {
                 kernel(
                     4,
@@ -648,19 +645,22 @@ fn width_shootout() -> Backend {
         }
     }
 
-    // The arm list, in tie-preference order. The 12-lane arm exists only
-    // where its 48 KiB working set fits the L1d it must live in (module
-    // docs); resolving its function pointer when ineligible is harmless.
-    let arms: [(Backend, BcryptLanesFn); 3] = [
-        (Backend::Avx512, bcrypt_lanes_fn(Backend::Avx512)),
-        (Backend::Avx2, bcrypt_lanes_fn(Backend::Avx2)),
-        (Backend::Avx2x12, bcrypt_lanes_fn(Backend::Avx2x12)),
-    ];
-    let arms = &arms[..if l1d_size().is_some_and(|bytes| bytes >= 48 * 1024) {
-        3
-    } else {
-        2
-    }];
+    // The arm list, in tie-preference order, from the capabilities
+    // `width_pick` established. Avx2 is always a candidate — its presence
+    // is what let detection reach the shootout at all — so the array is
+    // Avx2-initialized and only the conditional arms are written.
+    let mut arms = [(Backend::Avx2, bcrypt_lanes_fn(Backend::Avx2)); 3];
+    let mut n = 0;
+    if has_avx512 {
+        arms[n] = (Backend::Avx512, bcrypt_lanes_fn(Backend::Avx512));
+        n += 1;
+    }
+    n += 1;
+    if has_x12 {
+        arms[n] = (Backend::Avx2x12, bcrypt_lanes_fn(Backend::Avx2x12));
+        n += 1;
+    }
+    let arms = &arms[..n];
 
     let mut outs = [[[0u8; 24]; ITEMS]; 3];
     // Correctness before timing: these first calls also run each arm's own
@@ -817,7 +817,12 @@ mod tests {
 
     #[test]
     fn width_pick_is_stable_and_cached() {
-        if cfg!(miri) || !(Backend::Avx2.is_available() && Backend::Avx512.is_available()) {
+        // An active force bypasses the shootout entirely.
+        #[cfg(feature = "std")]
+        if std::env::var_os("BCRYPT_FORCE_BACKEND").is_some() {
+            return;
+        }
+        if cfg!(miri) || !Backend::Avx2.is_available() {
             return;
         }
         let first = detect();
@@ -826,10 +831,12 @@ mod tests {
             Backend::Avx2 | Backend::Avx512 | Backend::Avx2x12
         ));
         // Second call reads the cached pick: same answer, and where the
-        // shootout is compiled in at all its cache is populated.
+        // shootout has at least two candidates its cache is populated.
         assert_eq!(detect(), first);
         #[cfg(all(feature = "std", target_arch = "x86_64", not(debug_assertions), not(miri)))]
-        assert_ne!(CACHED_WIDTH.load(Ordering::Relaxed), UNINIT);
+        if Backend::Avx512.is_available() || l1d_size().is_some_and(|bytes| bytes >= 48 * 1024) {
+            assert!(WIDTH_PICK.get().is_some());
+        }
     }
 
     #[test]

@@ -78,10 +78,11 @@ re-forming microcoded gathers took the AVX-512 path from 383 h/s to
 parity.
 
 A 12-lane AVX2 kernel (`avx2_12`) targets 48 KiB-L1d chips (Zen 5, Ice
-Lake+): it joins the width shootout only when cpuid reports L1d ≥ 48 KiB,
-and only when it wins outright. Our lab has no such hardware, so no win is
-claimed — forced on Zen 4 it measures 0.76× (48 KiB thrashing a 32 KiB
-L1d), which is exactly why the gate exists.
+Lake+, and AVX2-only 48 KiB parts — Alder/Raptor Lake client, Xeon
+E-2400): it joins the width shootout only when cpuid reports L1d ≥ 48
+KiB, and only when it wins outright. Our lab has no such hardware, so no
+win is claimed — forced on Zen 4 it measures 0.76× (48 KiB thrashing a
+32 KiB L1d), which is exactly why the gate exists.
 
 Single-hash latency, cost 4: **646 µs** (criterion, M5 Max). Throughput
 scales with `2^cost`, so cost 12 runs 128× slower per hash than cost 5.
@@ -155,18 +156,21 @@ already engages siblings.
 
 ### Dispatch notes
 
-Which of AVX2 and AVX-512 wins is a µarch question (working-set and
+Which width wins is a µarch question (working-set and
 double-pump reasons above on Zen; the fast zmm hardware gather on Sapphire
-Rapids), so `detect()` answers it by measurement: on `std` release builds, a
-host advertising both runs a one-time width shootout — a cost-4, 32-item
-batch through both backends' kernels, outputs asserted byte-identical before
-anything is timed, three interleaved reps each, min wins — and caches the
-winner for the process. On hosts with L1d ≥ 48 KiB (Zen 5, Ice Lake+) the
-12-lane AVX2 kernel joins as a third arm, picked only if it wins outright —
-ties keep the wider incumbent. Debug, `no_std` and Miri builds keep the
-static AVX-512-first order. To override the pick, force the backend through
-`__internal::bcrypt_many_with_backend` (`internal-api` feature) or run the
-two explicitly and pick per machine, as `benches/micro.rs` does.
+Rapids), so `detect()` answers it by measurement: on `std` release builds,
+a host with at least two width candidates (AVX2 + AVX-512, or AVX2 with
+L1d ≥ 48 KiB) runs a one-time width shootout — a cost-4, 48-item batch
+through every candidate's kernel, outputs asserted byte-identical before
+anything is timed, three interleaved reps each, min wins, strict-win only
+(ties keep the wider incumbent). The pick is single-flight (`OnceLock`):
+racing cold callers park instead of duplicating the ~0.4 s measurement.
+Debug, `no_std` and Miri builds keep the static capability order. To
+override the pick entirely, set `BCRYPT_FORCE_BACKEND=<name>` (std builds;
+panics on an unknown or unavailable name — intended for simulators and
+benchmark harnesses), or drive kernels explicitly through
+`__internal::bcrypt_many_with_backend` (`internal-api` feature), as
+`benches/micro.rs` does.
 
 ## Quick start
 
@@ -206,7 +210,8 @@ bcrypt_many / hash_many / hash_many_with_salts / verify_many
               (avx2_12 ×12 — measured-shootout arm only, 48 KiB-L1d hosts)
       │
       ▼
- batch split into lane groups; short groups padded, padding discarded
+ batch split into lane groups; tails of 1-2 hashes run scalar (measured
+ win everywhere), larger short groups padded, padding discarded
       │
       ▼
  per-item outputs — byte-identical on every backend (asserted in tests)

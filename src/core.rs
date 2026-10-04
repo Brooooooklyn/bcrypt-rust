@@ -400,6 +400,7 @@ unsafe fn bcrypt_many_chunked(
     // its kernel pointer before entering the loop — nothing dispatches per
     // chunk.
     let kernel = crate::eks::bcrypt_lanes_fn(backend);
+    let scalar = crate::eks::bcrypt_lanes_fn(Backend::Scalar);
     let lanes = backend.lanes();
     // The stack arrays are sized for the widest backend that exists
     // (AVX-512, 16 lanes), so the layout is backend-independent; only
@@ -410,13 +411,38 @@ unsafe fn bcrypt_many_chunked(
     let mut out = [[0u8; 24]; 16];
     let mut base = 0;
     while base < kws.len() {
-        let group = lanes.min(kws.len() - base);
+        let remaining = kws.len() - base;
+        // A remainder of one or two hashes runs faster on the scalar
+        // kernel than padded to a full-width group: a padded call costs
+        // `lanes x t_scalar / S`, and a backend's per-hash speedup S never
+        // exceeds its lane count, so the wide call cannot beat two
+        // sequential scalar hashes. Measured: r=1 saves 88% (Zen 4,
+        // AVX-512) and 50% (M5 Max, NEON); r=2 wins or ties everywhere.
+        // Larger remainders break even at host-dependent points (r=3 on
+        // M5 Max, r=12-13 on Zen 4 under AVX-512), so they keep lockstep.
+        if remaining <= 2 && remaining < lanes {
+            for (slot, (&kw_in, &sw_in)) in kws[base..].iter().zip(&sws[base..]).enumerate() {
+                kw[0] = kw_in;
+                sw[0] = sw_in;
+                // SAFETY: the scalar kernel runs on every CPU, the slices
+                // are exactly its one lane, and `out` is a stack array
+                // owned by this frame — nothing else aliases it here.
+                unsafe { scalar(cost, &kw[..1], &sw[..1], &mut out[..1]) };
+                outs[base + slot] = out[0];
+            }
+            wipe_words(kw.as_flattened_mut());
+            wipe_words(sw.as_flattened_mut());
+            wipe_bytes(out.as_flattened_mut());
+            break;
+        }
+        let group = lanes.min(remaining);
         debug_assert!(group >= 1);
         kw[..group].copy_from_slice(&kws[base..base + group]);
         sw[..group].copy_from_slice(&sws[base..base + group]);
         // A short tail chunk is padded by repeating this chunk's first lane:
         // duplicate work whose outputs are discarded, so every kernel call
-        // is exactly `lanes` wide.
+        // is exactly `lanes` wide. (A tail of one or two never reaches
+        // here — it runs on the scalar kernel, above.)
         let fill_kw = kw[0];
         let fill_sw = sw[0];
         for slot in &mut kw[group..lanes] {
