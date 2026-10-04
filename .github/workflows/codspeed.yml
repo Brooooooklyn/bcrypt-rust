@@ -1,0 +1,52 @@
+name: CodSpeed
+
+# Separate from ci.yml on purpose: this workflow is a regression net whose
+# results CodSpeed reports through its own checks and PR comments — it is
+# not part of the `done` merge gate. Both triggers matter: pushes to main
+# record the baseline, pull requests are measured against it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets CodSpeed trigger backtest analysis to generate initial data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC authentication with CodSpeed
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  codspeed:
+    name: codspeed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup rust toolchain, cache and cargo-codspeed binary
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
+
+      # Only benches/codspeed.rs: the criterion harnesses (bcrypt.rs at
+      # cost 10+, vs_bcrypt.rs) would take minutes per benchmark under the
+      # CPU-simulation instrument and produce no CodSpeed measurements.
+      - name: Build the benchmark target
+        run: cargo codspeed build --bench codspeed
+
+      # BCRYPT_FORCE_BACKEND=avx2: the hosted-runner lottery mixes Intel
+      # (AVX-512) and AMD (AVX2) boxes; the Valgrind-based instrument
+      # implements no AVX-512 (the 16-lane kernel would crash on the first
+      # unimplemented instruction), and one pinned backend keeps the
+      # history comparable across runners. See src/eks/mod.rs.
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: cargo codspeed run --bench codspeed
+        env:
+          BCRYPT_FORCE_BACKEND: avx2

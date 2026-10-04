@@ -91,6 +91,19 @@
 //!   — [`detect`] returns [`Backend::Avx2`] and it really runs.
 //! * Never add `+avx512f`: `is_available()` would then report `true` while the
 //!   instruction itself traps with `SIGILL` (Rosetta has no AVX-512).
+//!
+//! # Forcing a backend: `BCRYPT_FORCE_BACKEND`
+//!
+//! `BCRYPT_FORCE_BACKEND=<name>` (std builds only) pins [`detect`] to one
+//! backend and skips the width shootout — an escape hatch for simulators
+//! and emulators that implement fewer instructions than the host CPU
+//! advertises. CodSpeed's Valgrind-based instrument has no AVX-512, so the
+//! benchmark CI pins `avx2`: it is the widest width the instrument fully
+//! implements, and one pinned backend keeps the performance history
+//! comparable across the Intel/AMD runner lottery. Unknown or unavailable
+//! names panic loudly; a silently ignored force would hide exactly the
+//! dispatch mistake it exists to pin down. Miri's Scalar pin outranks the
+//! variable — a forced SIMD backend would only crash the interpreter.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -369,6 +382,9 @@ static CACHED_BACKEND: AtomicU8 = AtomicU8::new(UNINIT);
 /// where it applies it can demote `Avx512` to `Avx2` — or, on hosts whose
 /// L1d is at least 48 KiB, to `Avx2x12` — by measurement.
 ///
+/// `BCRYPT_FORCE_BACKEND` (std only) outranks all of this, cascade and
+/// shootout alike — see the module docs.
+///
 /// The cascade itself always re-runs (a few `cpuid` reads, each cached by the
 /// standard library); the one expensive decision — the width shootout, when
 /// it applies — is cached after the first call, so a repeated `detect()`
@@ -380,9 +396,16 @@ pub fn detect() -> Backend {
         // SSE2, and wall-clock flavour shootouts mean nothing under an
         // interpreter. Scalar is the one backend that behaves identically
         // on every host Miri runs on, which is also what makes the Miri CI
-        // job arch-independent.
-        Backend::Scalar
-    } else if have_avx512f() {
+        // job arch-independent. The pin also outranks BCRYPT_FORCE_BACKEND:
+        // forcing a SIMD backend there would only crash the interpreter.
+        return Backend::Scalar;
+    }
+    // A forced backend outranks the cascade and the width shootout alike.
+    #[cfg(feature = "std")]
+    if let Some(forced) = forced_backend() {
+        return forced;
+    }
+    if have_avx512f() {
         // Both x86-64 SIMD widths exist; which is faster is a µarch
         // question the width shootout answers where it can (module docs).
         width_pick()
@@ -397,6 +420,36 @@ pub fn detect() -> Backend {
     } else {
         Backend::Scalar
     }
+}
+
+/// Total inverse of [`Backend::name`].
+#[cfg(feature = "std")]
+fn backend_by_name(name: &str) -> Option<Backend> {
+    Backend::ALL.iter().copied().find(|b| b.name() == name)
+}
+
+/// The `BCRYPT_FORCE_BACKEND=<name>` escape hatch, or `None` when unset.
+/// Unknown or unavailable names panic loudly: a silently ignored force
+/// would hide exactly the dispatch mistake it exists to pin down.
+#[cfg(feature = "std")]
+fn forced_backend() -> Option<Backend> {
+    let raw = std::env::var_os("BCRYPT_FORCE_BACKEND")?;
+    let name = raw
+        .to_str()
+        .unwrap_or_else(|| panic!("BCRYPT_FORCE_BACKEND is not UTF-8"));
+    let backend = backend_by_name(name).unwrap_or_else(|| {
+        let valid = Backend::ALL
+            .iter()
+            .map(|b| b.name())
+            .collect::<std::vec::Vec<_>>()
+            .join(", ");
+        panic!("BCRYPT_FORCE_BACKEND={name}: unknown backend (valid: {valid})");
+    });
+    assert!(
+        backend.is_available(),
+        "BCRYPT_FORCE_BACKEND={name} but {name} is not available on this host"
+    );
+    Some(backend)
 }
 
 /// Detect and populate the cache. Outlined so [`backend`] stays tiny.
@@ -745,6 +798,18 @@ mod tests {
     /// the shootout's arms and stable across calls — the winner is cached.
     /// Hosts without both widths (including Miri, which pins Scalar, and
     /// Rosetta, which lacks AVX-512) have no pick to make: skip.
+    #[cfg(feature = "std")]
+    #[test]
+    fn backend_by_name_round_trips_every_variant() {
+        for &b in Backend::ALL {
+            assert_eq!(backend_by_name(b.name()), Some(b));
+        }
+        // Exact, case-sensitive match only.
+        assert_eq!(backend_by_name("AVX2"), None);
+        assert_eq!(backend_by_name("avx-512"), None);
+        assert_eq!(backend_by_name(""), None);
+    }
+
     #[test]
     fn width_pick_is_stable_and_cached() {
         if cfg!(miri) || !(Backend::Avx2.is_available() && Backend::Avx512.is_available()) {
@@ -770,6 +835,12 @@ mod tests {
 
     #[test]
     fn detection_respects_the_architecture() {
+        // This test asserts unforced detection; an active force is doing
+        // exactly what it promises and must not trip the per-arch checks.
+        #[cfg(feature = "std")]
+        if std::env::var_os("BCRYPT_FORCE_BACKEND").is_some() {
+            return;
+        }
         if cfg!(miri) {
             // Detection is compile-time pinned to Scalar under Miri (the
             // interpreter implements no SIMD intrinsics); the pin itself

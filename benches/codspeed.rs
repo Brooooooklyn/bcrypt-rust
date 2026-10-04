@@ -25,6 +25,11 @@
 //!   wall-clock parallel speedup. The `parallel` feature is default-off, and
 //!   a batch of 8 is below its `2 x cores` threshold anyway, so every
 //!   measurement below is one thread on the detected backend.
+//! * **One pinned backend** — CI runs this suite with
+//!   `BCRYPT_FORCE_BACKEND=avx2`: the GitHub runner lottery mixes Intel
+//!   (AVX-512) and AMD (AVX2) boxes, the simulation instrument implements
+//!   no AVX-512, and one pinned backend keeps the performance history
+//!   comparable across runners.
 
 use std::time::Duration;
 

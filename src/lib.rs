@@ -91,7 +91,10 @@
 //! compile-time `target_feature` cfgs, then scalar). With neither, the
 //! byte-oriented core — [`bcrypt`], [`hash_with_salt`],
 //! [`hash_with_salt_bytes`], [`verify`], [`HashParts`] parsing/formatting —
-//! is fully functional.
+//! is fully functional. With `std`, `BCRYPT_FORCE_BACKEND=<name>` pins
+//! detection to one backend — an escape hatch for simulators and
+//! interpreters that implement fewer instructions than the host CPU
+//! advertises (CodSpeed's Valgrind instrument has no AVX-512).
 //!
 //! # `bcrypt`-crate compatibility
 //!
