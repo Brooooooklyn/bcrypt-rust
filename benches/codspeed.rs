@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use bcrypt_rust::{bcrypt, bcrypt_many, hash_with_salt};
+use bcrypt_rust::{Version, bcrypt, bcrypt_many, hash_with_salt, verify};
 use codspeed_criterion_compat::{Criterion, black_box, criterion_group, criterion_main};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
@@ -90,6 +90,27 @@ fn bench_batch(c: &mut Criterion) {
     group.finish();
 }
 
+/// The verifier end to end — the call consumers make most. Parses the
+/// `$2b$` string into `HashParts`, decodes the embedded salt, runs the same
+/// kernel as `hash_with_salt`, and constant-time-compares the result, so a
+/// regression in any of those is attributed to this arm. The hash under
+/// test is generated from the fixed salt at setup, keeping the suite
+/// hermetic and the fixture in sync with the encoder.
+fn bench_verify(c: &mut Criterion) {
+    let stored = hash_with_salt(PASSWORD, 4, SALT)
+        .expect("fixture hash")
+        .format_for_version(Version::TwoB);
+    verify(PASSWORD, &stored).expect("warm-up verify");
+
+    let mut group = c.benchmark_group("public/verify");
+    group.bench_function("verify_cost4", |b| {
+        b.iter(|| {
+            black_box(verify(black_box(PASSWORD), black_box(&stored)).expect("verify"));
+        });
+    });
+    group.finish();
+}
+
 /// The raw core with no formatting and no batch machinery: the pure kernel
 /// latency the two public arms above are built on. A divergence between
 /// this arm and `hash_with_salt_cost4` isolates a regression to the codec.
@@ -110,14 +131,18 @@ fn bench_raw_core(c: &mut Criterion) {
 /// is crate-private; what is timed is exactly what `hash`/`verify` run:
 /// NEON on aarch64, the AVX2/SSSE3 pick on x86-64, v128 under wasm simd128.
 fn bench_base64(c: &mut Criterion) {
-    use bcrypt_rust::__internal::{decode_23, encode_16, encode_23};
+    use bcrypt_rust::__internal::{decode_16, decode_23, encode_16, encode_23};
 
     let hash_bytes = [0xA5u8; 23];
+    let enc16 = encode_16(&SALT);
     let enc23 = encode_23(&hash_bytes);
     let mut group = c.benchmark_group("base64");
 
     group.bench_function("encode_16", |b| {
         b.iter(|| black_box(encode_16(black_box(&SALT))));
+    });
+    group.bench_function("decode_16", |b| {
+        b.iter(|| black_box(decode_16(black_box(&enc16)).expect("decodes")));
     });
     group.bench_function("encode_23", |b| {
         b.iter(|| black_box(encode_23(black_box(&hash_bytes))));
@@ -135,6 +160,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_single_hash, bench_batch, bench_raw_core, bench_base64
+    targets = bench_single_hash, bench_verify, bench_batch, bench_raw_core, bench_base64
 }
 criterion_main!(benches);
