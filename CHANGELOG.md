@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2](https://github.com/Brooooooklyn/bcrypt-rust/compare/v1.0.1...v1.0.2) - 2026-10-05
+
+### Other
+
+- *(eks)* hoist the P-array xor off the scalar round's load chain
+- Revert "perf(eks): hoist the P-array xor off the scalar round's load chain"
+- *(eks)* hoist the P-array xor off the scalar round's load chain
+
 ## [1.0.1](https://github.com/Brooooooklyn/bcrypt-rust/compare/v1.0.0...v1.0.1) - 2026-10-05
 
 ### Other
