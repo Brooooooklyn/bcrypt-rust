@@ -179,47 +179,36 @@ jobs:
       - run: cargo fmt --all -- --check
 
   lint:
-    name: lint (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Two native legs: the x86_64 and aarch64 kernels are cfg'd out on
-          # the other's host, and this crate's lint bar is `-D warnings`.
-          - name: clippy x86_64 linux
-            os: ubuntu-latest
-            targets: ""
-            wasm: false
-          - name: clippy aarch64 macOS
-            os: macos-latest
-            targets: ""
-            wasm: false
-          # The wasm128 modules compile nowhere else; criterion benches do
-          # not build for wasi, so this leg is --lib only.
-          - name: clippy wasm32 simd128
-            os: ubuntu-latest
-            targets: wasm32-wasip1
-            wasm: true
-    runs-on: ${{ matrix.os }}
+    name: lint (clippy)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          targets: ${{ matrix.targets }}
+          targets: aarch64-apple-darwin, wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       # --release is deliberate: the x86-64 width/flavor shootout code is
       # cfg'd INTO release builds (not(debug_assertions)), so only release
       # clippy sees it — its undocumented-unsafe blocks escaped a debug-only
       # lint run once already.
-      - if: ${{ !matrix.wasm }}
-        run: cargo clippy --release --all-targets -- -D warnings
-      - if: ${{ !matrix.wasm }}
-        run: cargo clippy --release --all-targets --all-features -- -D warnings
-      - if: ${{ !matrix.wasm }}
-        run: cargo clippy --release --lib --no-default-features -- -D warnings
-      - if: ${{ matrix.wasm }}
-        run: cargo clippy --release --lib --target wasm32-wasip1 -- -D warnings
+      #
+      # One job, three target views: the x86_64 kernels, the aarch64 NEON
+      # kernels plus the Apple-specific entropy/cache code, and the wasm128
+      # modules are each cfg'd out under the other targets, and this crate's
+      # lint bar is `-D warnings`. Cross-target clippy is check-only (no
+      # linking), so a single ubuntu runner covers all three; the apple
+      # target must be darwin (not linux-gnu) because random.rs and
+      # eks/mod.rs carry cfg(target_os/vendor)-gated Apple code.
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo clippy --release --all-targets --all-features -- -D warnings
+      - run: cargo clippy --release --lib --no-default-features -- -D warnings
+      - run: cargo clippy --release --all-targets --target aarch64-apple-darwin -- -D warnings
+      - run: cargo clippy --release --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+      - run: cargo clippy --release --lib --no-default-features --target aarch64-apple-darwin -- -D warnings
+      # The wasm128 modules compile nowhere else; criterion benches do not
+      # build for wasi, so this leg is --lib only.
+      - run: cargo clippy --release --lib --target wasm32-wasip1 -- -D warnings
         env:
           RUSTFLAGS: -C target-feature=+simd128
 
