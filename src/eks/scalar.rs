@@ -41,6 +41,29 @@ fn f(state: &State, x: u32) -> u32 {
     (state.s[0][a].wrapping_add(state.s[1][b]) ^ state.s[2][c]).wrapping_add(state.s[3][d])
 }
 
+/// `a ^ b` behind an opaque boundary. On x86-64 this is one `xor`
+/// instruction LLVM cannot fold into a reassociated xor tree: callers pass
+/// `f(...)` as `a` and `other_half ^ p[i]` (computed while the S-box loads
+/// are in flight) as `b`, so the post-load dependency chain is a single xor
+/// instead of `(f ^ other) ^ p[i]`'s two.
+#[inline(always)]
+fn xor_late(a: u32, b: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a register-register xor is always valid; no memory or flags
+    // are read or written.
+    unsafe {
+        let mut out = a;
+        core::arch::asm!("xor {o:e}, {b:e}", o = inout(reg) out, b = in(reg) b,
+                         options(pure, nomem, nostack, preserves_flags));
+        out
+    }
+    // miri cannot execute inline assembly; fall back to the scalar xor.
+    #[cfg(any(not(target_arch = "x86_64"), miri))]
+    {
+        a ^ b
+    }
+}
+
 /// One Blowfish block encryption under the state's current P-array.
 ///
 /// The crypt_blowfish `BF_ENCRYPT` round shape: `l` takes P[0] alone, then
@@ -49,12 +72,18 @@ fn f(state: &State, x: u32) -> u32 {
 /// L/R roles alternate on the registers themselves. The final swap and the
 /// P[17] whitening then fold into the return order: the left output word is
 /// the whitened old right half.
+///
+/// Each fused round is written as `xor_late(f(x), other ^ p[i])`: the P-array
+/// xor is combined with the other half while the four S-box loads are in
+/// flight, so the post-load dependency chain is a single xor. LLVM
+/// reassociates `x ^ p ^ f` the other way (two serial xors after the loads),
+/// which measured ~4% slower than gcc's crypt_blowfish on Zen 4.
 #[inline(always)]
 fn encipher(state: &State, mut l: u32, mut r: u32) -> (u32, u32) {
     l ^= state.p[0];
     for i in (1..16).step_by(2) {
-        r ^= state.p[i] ^ f(state, l);
-        l ^= state.p[i + 1] ^ f(state, r);
+        r = xor_late(f(state, l), r ^ state.p[i]);
+        l = xor_late(f(state, r), l ^ state.p[i + 1]);
     }
     // Output halves are (old r ^ P[17], old l): the post-round swap and the
     // P[17] whitening are both implicit in the tuple order.
