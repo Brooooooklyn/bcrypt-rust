@@ -13,8 +13,8 @@
 //! * the cost loop expands the **key first, then the salt** (OpenBSD order;
 //!   the paper lists them the other way round);
 //! * [`expand_state`] consumes salt words as **one continuous stream** across
-//!   the P-array and S-box loops — its salt counter does not reset between
-//!   them, so the S-box loop starts at stream offset 18 (`j % 4 == 2`).
+//!   the P-array and S-box loops — the counter does not reset between them,
+//!   so the S-box loop resumes at stream offset 18 (salt word index 2).
 
 use crate::consts::{P_INIT, S_INIT};
 
@@ -43,54 +43,62 @@ fn f(state: &State, x: u32) -> u32 {
 
 /// One Blowfish block encryption under the state's current P-array.
 ///
-/// 16 Feistel rounds, each `xl ^= P[i]; xr ^= F(xl)` followed by a half-swap;
-/// the swap after the final round is undone, then the two remaining P-words
-/// whiten the output halves.
+/// The crypt_blowfish `BF_ENCRYPT` round shape: `l` takes P[0] alone, then
+/// eight pairs of fused half-rounds (`r ^= P[i] ^ F(l)` alternating with
+/// `l ^= P[i+1] ^ F(r)`) consume P[1]..P[16] — no swaps inside the loop, the
+/// L/R roles alternate on the registers themselves. The final swap and the
+/// P[17] whitening then fold into the return order: the left output word is
+/// the whitened old right half.
 #[inline(always)]
 fn encipher(state: &State, mut l: u32, mut r: u32) -> (u32, u32) {
-    for &p in &state.p[..16] {
-        l ^= p;
-        r ^= f(state, l);
-        core::mem::swap(&mut l, &mut r);
+    l ^= state.p[0];
+    for i in (1..16).step_by(2) {
+        r ^= state.p[i] ^ f(state, l);
+        l ^= state.p[i + 1] ^ f(state, r);
     }
-    core::mem::swap(&mut l, &mut r);
-    r ^= state.p[16];
-    l ^= state.p[17];
-    (l, r)
+    // Output halves are (old r ^ P[17], old l): the post-round swap and the
+    // P[17] whitening are both implicit in the tuple order.
+    r ^= state.p[17];
+    (r, l)
 }
 
 /// OpenBSD `Blowfish_expandstate`: XOR the key into P, then encrypt a zero
 /// block 521 times, mixing salt words into the running block and writing
 /// each ciphertext pair back over P (9 pairs) and then S (512 pairs).
 ///
-/// `j` walks the salt words continuously across **both** loops: the P loop
-/// consumes 18 words, so the first S-box pair XORs `salt[2]` and `salt[3]`,
-/// not `salt[0]` and `salt[1]`. Each write is visible to the encryptions
-/// that follow it — that is what makes the chain strictly sequential.
+/// The salt words are consumed as **one continuous stream** across both
+/// loops — the counter does not reset between them. The P loop reads the
+/// (0,1) and (2,3) word pairs alternately, which is `i & 2`/`(i & 2) + 1`
+/// as crypt_blowfish writes it. Having consumed 18 words there (18 ≡ 2 mod
+/// 4), the stream resumes inside the S loop at index 2, so every S-box
+/// pair alternates salt (2,3) then (0,1) and the two-encipher iteration
+/// consumes exactly 4 words — the phase survives between iterations. Each
+/// write is visible to the encryptions that follow it — that is what makes
+/// the chain strictly sequential.
 fn expand_state(state: &mut State, salt_words: &[u32; 4], key_words: &[u32; 18]) {
     for (p, &k) in state.p.iter_mut().zip(key_words.iter()) {
         *p ^= k;
     }
     let (mut l, mut r) = (0u32, 0u32);
-    let mut j = 0usize;
-    for pair in 0..9 {
-        l ^= salt_words[j % 4];
-        j += 1;
-        r ^= salt_words[j % 4];
-        j += 1;
+    for i in (0..18).step_by(2) {
+        l ^= salt_words[i & 2];
+        r ^= salt_words[(i & 2) + 1];
         (l, r) = encipher(state, l, r);
-        state.p[2 * pair] = l;
-        state.p[2 * pair + 1] = r;
+        state.p[i] = l;
+        state.p[i + 1] = r;
     }
     for s_box in 0..4 {
-        for pair in 0..128 {
-            l ^= salt_words[j % 4];
-            j += 1;
-            r ^= salt_words[j % 4];
-            j += 1;
+        for i in (0..256).step_by(4) {
+            l ^= salt_words[2];
+            r ^= salt_words[3];
             (l, r) = encipher(state, l, r);
-            state.s[s_box][2 * pair] = l;
-            state.s[s_box][2 * pair + 1] = r;
+            state.s[s_box][i] = l;
+            state.s[s_box][i + 1] = r;
+            l ^= salt_words[0];
+            r ^= salt_words[1];
+            (l, r) = encipher(state, l, r);
+            state.s[s_box][i + 2] = l;
+            state.s[s_box][i + 3] = r;
         }
     }
 }
@@ -100,16 +108,16 @@ fn expand_state(state: &mut State, salt_words: &[u32; 4], key_words: &[u32; 18])
 /// minus the salt mixing — the running block is only ever enciphered.
 fn encrypt_zero_chain(state: &mut State) {
     let (mut l, mut r) = (0u32, 0u32);
-    for pair in 0..9 {
+    for i in (0..18).step_by(2) {
         (l, r) = encipher(state, l, r);
-        state.p[2 * pair] = l;
-        state.p[2 * pair + 1] = r;
+        state.p[i] = l;
+        state.p[i + 1] = r;
     }
     for s_box in 0..4 {
-        for pair in 0..128 {
+        for i in (0..256).step_by(2) {
             (l, r) = encipher(state, l, r);
-            state.s[s_box][2 * pair] = l;
-            state.s[s_box][2 * pair + 1] = r;
+            state.s[s_box][i] = l;
+            state.s[s_box][i + 1] = r;
         }
     }
 }
