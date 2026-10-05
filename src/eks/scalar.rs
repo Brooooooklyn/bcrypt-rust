@@ -48,7 +48,7 @@ fn f(state: &State, x: u32) -> u32 {
 /// instead of `(f ^ other) ^ p[i]`'s two.
 #[inline(always)]
 fn xor_late(a: u32, b: u32) -> u32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     // SAFETY: a register-register xor is always valid; no memory or flags
     // are read or written.
     unsafe {
@@ -57,7 +57,8 @@ fn xor_late(a: u32, b: u32) -> u32 {
                          options(pure, nomem, nostack, preserves_flags));
         out
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // miri cannot execute inline assembly; fall back to the scalar xor.
+    #[cfg(any(not(target_arch = "x86_64"), miri))]
     {
         a ^ b
     }
