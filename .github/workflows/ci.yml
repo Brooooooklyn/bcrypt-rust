@@ -203,8 +203,13 @@ jobs:
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo clippy --release --all-targets --all-features -- -D warnings
       - run: cargo clippy --release --lib --no-default-features -- -D warnings
-      - run: cargo clippy --release --all-targets --target aarch64-apple-darwin -- -D warnings
-      - run: cargo clippy --release --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+      # The cross legs are --lib only: criterion's `alloca` dependency has a
+      # C build script that cannot cross-compile to darwin from a linux
+      # host, and tests/benches carry no target-cfg'd code, so the host's
+      # --all-targets legs already lint every line --all-targets would add
+      # here. The lib has zero dependencies and cross-lints cleanly.
+      - run: cargo clippy --release --lib --target aarch64-apple-darwin -- -D warnings
+      - run: cargo clippy --release --lib --all-features --target aarch64-apple-darwin -- -D warnings
       - run: cargo clippy --release --lib --no-default-features --target aarch64-apple-darwin -- -D warnings
       # The wasm128 modules compile nowhere else; criterion benches do not
       # build for wasi, so this leg is --lib only.
