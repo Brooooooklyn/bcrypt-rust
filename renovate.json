@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "description": [
+    "bcrypt-rust has zero runtime dependencies. Renovate covers Cargo",
+    "dev-dependencies (root crate + fuzz/) and keeps GitHub Actions",
+    "SHA-pinned. MSRV guard: a dep that raises rustc requirements fails",
+    "the CI msrv leg (cargo +1.89 check) and the PR stays unmerged."
+  ],
+  "timezone": "Asia/Singapore",
+  "schedule": ["before 5am on the first day of the month"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 2,
+  "pinDigests": true,
+  "packageRules": [
+    {
+      "description": "One monthly PR for all GitHub Actions updates.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "One monthly PR for all Cargo updates (dev-deps only).",
+      "matchManagers": ["cargo"],
+      "groupName": "cargo dependencies"
+    }
+  ]
+}
