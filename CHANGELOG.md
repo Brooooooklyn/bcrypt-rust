@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1](https://github.com/Brooooooklyn/bcrypt-rust/compare/v1.0.0...v1.0.1) - 2026-10-05
+
+### Other
+
+- *(codspeed)* cover verify and decode_16 ([#5](https://github.com/Brooooooklyn/bcrypt-rust/pull/5))
+- *(eks)* write scalar encipher in crypt_blowfish fused-round shape
+- add Renovate config (grouped monthly, SHA-pinned actions)
+
 ## [1.0.0](https://github.com/Brooooooklyn/bcrypt-rust/releases/tag/v1.0.0) - 2026-10-05
 
 First stable release. (0.1.0 was the crates.io bootstrap publish.)
